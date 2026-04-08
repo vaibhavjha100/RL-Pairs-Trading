@@ -72,3 +72,6 @@ Desktop.ini
 # IDE
 .idea/
 .vscode/
+
+# Local scratch file
+test.py
