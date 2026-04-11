@@ -297,8 +297,8 @@ def test_cointegration(candidate_pairs, train_df, pvalue_threshold=0.05, out_dir
         tested_pairs += 1
 
         # Directional Engle-Granger: keep lower p-value direction
-        _, pval_t1_t2, _ = coint(y1, y2, trend='ct')
-        _, pval_t2_t1, _ = coint(y2, y1, trend='ct')
+        _, pval_t1_t2, _ = coint(y1, y2, trend='c')
+        _, pval_t2_t1, _ = coint(y2, y1, trend='c')
 
         if pval_t1_t2 <= pval_t2_t1:
             best_pair = (t1, t2)

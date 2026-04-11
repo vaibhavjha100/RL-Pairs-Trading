@@ -2,6 +2,9 @@
 data/
 eda/
 
+# Saved model checkpoints (per-agent subdirs, e.g. models/MPHDRL/)
+models/
+
 # Office documents
 *.doc
 *.docx

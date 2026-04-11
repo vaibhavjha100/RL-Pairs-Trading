@@ -2,6 +2,8 @@ import os
 import sys
 import pickle
 import logging
+from datetime import date
+from datetime import timedelta
 import pandas as pd
 import yfinance as yf
 
@@ -70,10 +72,10 @@ def main():
     except Exception as e:
         logging.error(f"Failed to save dictionary to {pkl_path}: {e}")
         
-    # 4. Use yfinance to download daily history from 2015 through 2026
-    # yfinance `end` is exclusive, so use 2027-01-01 to include 2026-12-31.
-    start_date = "2015-01-01"
-    end_date = "2027-01-01"
+    # 4. Use yfinance to download daily history from 2018 through today.
+    # yfinance `end` is exclusive, so use tomorrow's date to include today's bar.
+    start_date = "2018-01-01"
+    end_date = (date.today() + timedelta(days=1)).isoformat()
     logging.info(
         f"Downloading historical daily data for {len(symbols)} tickers "
         f"(start='{start_date}', end='{end_date}', interval='1d')..."
