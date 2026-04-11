@@ -5,7 +5,18 @@ Full model architecture extending HDRL-Trader (Kim et al., 2022) to a multi-pair
 portfolio setting. Contains all network modules, environment, replay buffer,
 target-network wiring, and checkpoint utilities.
 
-training.py (separate file) will orchestrate the training loop.
+Design reference: multi_pair_hdrl_trader_architecture.md (repo root). Implemented
+pieces match that document where noted below; deliberate or pending gaps:
+
+- Stop-loss magnitudes are used in the portfolio network and stored in replay, but
+  TradingEnvironment does not yet simulate spread paths against stop boundaries (§6.2).
+- TD3 bootstrap uses next-state encodings and target-actor next discrete actions; it
+  does not re-evaluate target portfolio weights w' in the critic target (§8.2 optional
+  path); critics remain Q(S, A_pairs) as in §3.
+- Portfolio aggregation uses per-pair MLP scalars E_p then u = E @ M (same as u = M^T E
+  in column form); cross-pair attention from §5.4 is simplified to independent E_p heads.
+
+training.py orchestrates the training loop and should stay consistent with this module.
 """
 
 import os
@@ -302,6 +313,14 @@ class PortfolioWeightsNetwork(nn.Module):
 # ============================================================================
 
 class TradingEnvironment:
+    """
+    Train-split daily rollouts: windows from spread_X_train, returns from trading
+    closes, reward = net return minus HPARAMS-style risk term (§7).
+
+    Pair-level stop-loss hits (§6.2) are not applied to returns yet; sl_actions are
+    reserved for portfolio construction and learning only.
+    """
+
     def __init__(self, pairs, tickers, ticker_to_idx, trading_raw_path,
                  sequence_meta, X_train, y_train, zeta=0.003, gamma=0.5,
                  risk_lambda=1.0, var_window=60):
@@ -354,15 +373,21 @@ class TradingEnvironment:
         windows = np.zeros((self.n_pairs, self.X_train.shape[1], self.X_train.shape[2]),
                            dtype=np.float32)
         mask = np.zeros(self.n_pairs, dtype=bool)
+        y_vec = np.zeros(self.n_pairs, dtype=np.float32)
         pair_key_to_idx = {f"{a}|{b}": i for i, (a, b) in enumerate(self.pairs)}
         for pair_str, sample_idx in pair_indices.items():
             if pair_str in pair_key_to_idx:
                 p_idx = pair_key_to_idx[pair_str]
                 windows[p_idx] = self.X_train[sample_idx]
                 mask[p_idx] = True
-        return windows, mask
+                y_vec[p_idx] = float(self.y_train[sample_idx])
+        return windows, mask, y_vec
 
     def step(self, w, sl_actions=None, spread_values=None):
+        """
+        sl_actions / spread_values are reserved for future §6.2 stop-loss simulation
+        against realized spreads; portfolio weights w already reflect stop embeddings.
+        """
         if self.t + 1 >= len(self.unique_dates):
             return None, 0.0, True
 

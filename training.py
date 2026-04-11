@@ -5,6 +5,9 @@ Supports multiple RL agent types via a registry pattern. Currently implements
 the MPHDRL training loop; future agents (benchmarks, ablations) can be added
 by registering a new trainer class.
 
+Training logic follows multi_pair_hdrl_trader_architecture.md (TD3 critics,
+DDQN stop-loss head, delayed actor + portfolio + auxiliary regression, PER).
+
 Usage:
     python training.py --agent MPHDRL --epochs 100
     python training.py --agent MPHDRL --epochs 50 --device cuda
@@ -189,7 +192,7 @@ class MPHDRLTrainer(BaseTrainer):
         transitions_collected = 0
 
         while True:
-            windows, mask = state_info
+            windows, mask, y_spread = state_info
             with torch.no_grad():
                 step_out = self.model.forward_step(windows, explore=True)
 
@@ -200,7 +203,7 @@ class MPHDRLTrainer(BaseTrainer):
             next_info, reward, done = self.env.step(w_np)
 
             if next_info is not None:
-                next_windows, next_mask = next_info
+                next_windows, next_mask, _next_y = next_info
             else:
                 next_windows = np.zeros_like(windows)
 
@@ -210,6 +213,7 @@ class MPHDRLTrainer(BaseTrainer):
                 "stop_loss": sl_np.astype(np.int64),
                 "weights": w_np.astype(np.float32),
                 "reward": np.float32(reward),
+                "y_spread": y_spread.astype(np.float32),
                 "next_state_windows": next_windows.astype(np.float32),
             }
             self.replay.add(transition)
@@ -309,17 +313,20 @@ class MPHDRLTrainer(BaseTrainer):
             Ba, Pa, Ha = h_a.shape
             logits_a = self.model.actor(h_a.reshape(Ba * Pa, Ha))
             probs_a = F.softmax(logits_a, dim=-1)
-            acts_a = probs_a.argmax(dim=-1).reshape(Ba, Pa)
-            acts_a_oh = F.one_hot(acts_a, num_classes=3).float()
+            # Differentiable policy signal: expected soft action (§5.3, §8.3 spirit).
+            # Critics are trained on stored one-hot actions; actor step uses soft probs.
+            soft_actions = probs_a.reshape(Ba, Pa * 3)
 
             h_c1_for_actor = self.model.encode_all_pairs(sw, self.model.srl_critic1)
-            q_for_actor = self.model.critic1(h_c1_for_actor.mean(dim=1), acts_a_oh.reshape(Ba, -1))
+            q_for_actor = self.model.critic1(h_c1_for_actor.mean(dim=1), soft_actions)
             loss_actor_pg = -q_for_actor.mean()
 
-            # Regression loss
+            # Regression loss (§1.4, §8.5): per-pair label from same row as state window.
             spread_pred = self.model.regression_head(h_a.reshape(Ba * Pa, Ha)).reshape(Ba, Pa)
             y_batch = torch.tensor(
-                np.stack([self.data["y_train"][0:Pa]] * Ba),
+                np.stack(
+                    [t.get("y_spread", np.zeros(self.n_pairs, dtype=np.float32)) for t in batch]
+                ),
                 dtype=torch.float32, device=dev,
             )
             loss_reg = F.mse_loss(spread_pred, y_batch)
