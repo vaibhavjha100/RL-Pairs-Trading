@@ -12,6 +12,9 @@ Usage:
     python training.py --agent MPHDRL --epochs 100
     python training.py --agent MPHDRL --epochs 50 --device cuda
     python training.py --agent MPHDRL --epochs 50 --device auto
+
+On CUDA: cudnn benchmark, TF32 for matmul/cudnn, high FP32 matmul precision, and
+non_blocking host→device copies where applicable.
 """
 
 import os
@@ -81,12 +84,18 @@ def resolve_training_device(preference: str) -> torch.device:
 
 
 def configure_accelerator(device: torch.device) -> None:
-    """Best-effort runtime tuning after the device is chosen."""
+    """GPU-oriented runtime tuning (CUDA TF32 / cudnn; MPS matmul precision)."""
     if device.type == "cuda":
         if hasattr(torch.backends, "cudnn") and torch.backends.cudnn.is_available():
             torch.backends.cudnn.benchmark = True
         if hasattr(torch, "set_float32_matmul_precision"):
             torch.set_float32_matmul_precision("high")
+        if hasattr(torch.backends, "cuda"):
+            torch.backends.cuda.matmul.allow_tf32 = True
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.allow_tf32 = True
+    elif device.type == "mps" and hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
 
 
 # ============================================================================
@@ -163,6 +172,15 @@ class MPHDRLTrainer(BaseTrainer):
 
         self._build_optimizers()
 
+    def _h2d(self, arr, dtype=torch.float32):
+        """Numpy (or array-like) → model device; pin_memory + non_blocking on CUDA only."""
+        dev = self.model.device
+        if dev.type == "cuda":
+            return torch.as_tensor(np.asarray(arr), dtype=dtype).pin_memory().to(
+                dev, non_blocking=True
+            )
+        return torch.tensor(np.asarray(arr), dtype=dtype, device=dev)
+
     def _build_optimizers(self):
         lr = HPARAMS["lr"]
         self.opt_critic1 = torch.optim.Adam(
@@ -234,13 +252,14 @@ class MPHDRLTrainer(BaseTrainer):
             return {}
 
         batch, indices, is_weights = self.replay.sample(B)
-        is_weights = is_weights.to(dev)
+        nb = dev.type == "cuda"
+        is_weights = is_weights.to(dev, non_blocking=nb)
 
-        sw = torch.tensor(np.stack([t["state_windows"] for t in batch]), dtype=torch.float32, device=dev)
-        acts = torch.tensor(np.stack([t["actions"] for t in batch]), dtype=torch.int64, device=dev)
-        sls = torch.tensor(np.stack([t["stop_loss"] for t in batch]), dtype=torch.int64, device=dev)
-        rews = torch.tensor(np.array([t["reward"] for t in batch]), dtype=torch.float32, device=dev)
-        nsw = torch.tensor(np.stack([t["next_state_windows"] for t in batch]), dtype=torch.float32, device=dev)
+        sw = self._h2d(np.stack([t["state_windows"] for t in batch]))
+        acts = self._h2d(np.stack([t["actions"] for t in batch]), dtype=torch.int64)
+        sls = self._h2d(np.stack([t["stop_loss"] for t in batch]), dtype=torch.int64)
+        rews = self._h2d(np.array([t["reward"] for t in batch]))
+        nsw = self._h2d(np.stack([t["next_state_windows"] for t in batch]))
 
         acts_onehot = F.one_hot(acts, num_classes=3).float()
 
@@ -323,11 +342,10 @@ class MPHDRLTrainer(BaseTrainer):
 
             # Regression loss (§1.4, §8.5): per-pair label from same row as state window.
             spread_pred = self.model.regression_head(h_a.reshape(Ba * Pa, Ha)).reshape(Ba, Pa)
-            y_batch = torch.tensor(
+            y_batch = self._h2d(
                 np.stack(
                     [t.get("y_spread", np.zeros(self.n_pairs, dtype=np.float32)) for t in batch]
-                ),
-                dtype=torch.float32, device=dev,
+                )
             )
             loss_reg = F.mse_loss(spread_pred, y_batch)
 
