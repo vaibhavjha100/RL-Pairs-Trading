@@ -300,7 +300,7 @@ class PortfolioWeightsNetwork(nn.Module):
 
 class TradingEnvironment:
     def __init__(self, pairs, tickers, ticker_to_idx, trading_raw_path,
-                 sequence_meta, X_train, y_train, zeta=0.003, risk_lambda=1.0,
+                 sequence_meta, X_train, y_train, zeta=0.003, risk_gamma=0.5,
                  var_window=60):
         self.pairs = pairs
         self.tickers = tickers
@@ -308,7 +308,7 @@ class TradingEnvironment:
         self.n_tickers = len(tickers)
         self.n_pairs = len(pairs)
         self.zeta = zeta
-        self.risk_lambda = risk_lambda
+        self.risk_gamma = risk_gamma
         self.var_window = var_window
 
         raw_df = pd.read_csv(trading_raw_path, parse_dates=["Date"])
@@ -426,10 +426,14 @@ class PrioritizedReplayBuffer:
         self.pos = (self.pos + 1) % self.capacity
 
     def sample(self, batch_size):
+        if self.size < 1:
+            raise ValueError("Cannot sample from an empty replay buffer.")
         probs = self.priorities[:self.size] ** self.alpha
         probs /= probs.sum()
 
-        indices = np.random.choice(self.size, size=batch_size, replace=False, p=probs)
+        # replace=False requires batch_size <= self.size; also batch_size can exceed capacity.
+        replace = batch_size > self.size
+        indices = np.random.choice(self.size, size=batch_size, replace=replace, p=probs)
         weights = (self.size * probs[indices]) ** (-self.beta)
         weights /= weights.max()
 
