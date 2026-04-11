@@ -75,3 +75,6 @@ Desktop.ini
 
 # Local scratch file
 test.py
+
+# Local architecture notes (not versioned)
+multi_pair_hdrl_trader_architecture.md
