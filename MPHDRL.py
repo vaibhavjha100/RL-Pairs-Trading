@@ -32,6 +32,7 @@ HPARAMS = {
     "tb": 1.0,
     "zeta": 0.003,
     "risk_lambda": 1.0,
+    "gamma": 0.5,
     "var_window": 60,
     "delay_c": 4,
     "delay_b": 2,
@@ -42,10 +43,13 @@ HPARAMS = {
     "tau": 0.005,
     "batch_size": 32,
     "lr": 0.0001,
-    "gamma": 0.99,
+    "discount_gamma": 0.99,
     "stop_loss_magnitudes": [1.5, 2.0, 2.5, 3.0, 3.5],
     "stop_loss_embed_dim": 8,
 }
+
+# Trained weights live under models/<agent>/ (models/ is gitignored).
+MPHDRL_MODEL_DIR = os.path.join("models", "MPHDRL")
 
 # ============================================================================
 # Segment 0: Data readiness check
@@ -67,8 +71,7 @@ def check_data_readiness():
     base = os.path.join("data", "pickle")
     spread_dir = os.path.join("data", "spread")
     trading_dir = os.path.join("data", "trading")
-    model_dir = os.path.join("model", "MPHDRL")
-    os.makedirs(model_dir, exist_ok=True)
+    os.makedirs(MPHDRL_MODEL_DIR, exist_ok=True)
 
     artifacts = {
         "spread_X_train": os.path.join(base, "spread_X_train.pkl"),
@@ -119,7 +122,7 @@ def check_data_readiness():
     print(f"  Pairs              : {len(pairs)}")
     print(f"  Unique tickers     : {len(tickers)}")
     print(f"  Mapping matrix M   : {M.shape}")
-    print(f"  Model dir          : {os.path.abspath(model_dir)}")
+    print(f"  Model dir          : {os.path.abspath(MPHDRL_MODEL_DIR)}")
 
     if all_ok:
         print("\nDATA READINESS: PASS")
@@ -300,15 +303,16 @@ class PortfolioWeightsNetwork(nn.Module):
 
 class TradingEnvironment:
     def __init__(self, pairs, tickers, ticker_to_idx, trading_raw_path,
-                 sequence_meta, X_train, y_train, zeta=0.003, risk_gamma=0.5,
-                 var_window=60):
+                 sequence_meta, X_train, y_train, zeta=0.003, gamma=0.5,
+                 risk_lambda=1.0, var_window=60):
         self.pairs = pairs
         self.tickers = tickers
         self.ticker_to_idx = ticker_to_idx
         self.n_tickers = len(tickers)
         self.n_pairs = len(pairs)
         self.zeta = zeta
-        self.risk_gamma = risk_gamma
+        self.gamma = gamma
+        self.risk_lambda = risk_lambda
         self.var_window = var_window
 
         raw_df = pd.read_csv(trading_raw_path, parse_dates=["Date"])
@@ -390,7 +394,7 @@ class TradingEnvironment:
         else:
             var_r = 0.0
 
-        reward = net_return - 0.5 * self.risk_lambda * var_r
+        reward = net_return - self.gamma * self.risk_lambda * var_r
         self.prev_w = w.copy()
         self.t += 1
         next_state = self._get_state_windows()
@@ -594,7 +598,7 @@ class MPHDRLTrader(nn.Module):
 
     def save_checkpoint(self, path=None):
         if path is None:
-            path = os.path.join("model", "MPHDRL", "checkpoint.pt")
+            path = os.path.join(MPHDRL_MODEL_DIR, "checkpoint.pt")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         state = {
             "srl_actor": self.srl_actor.state_dict(),
@@ -622,7 +626,7 @@ class MPHDRLTrader(nn.Module):
 
     def load_checkpoint(self, path=None):
         if path is None:
-            path = os.path.join("model", "MPHDRL", "checkpoint.pt")
+            path = os.path.join(MPHDRL_MODEL_DIR, "checkpoint.pt")
         state = torch.load(path, map_location=self.device)
         self.srl_actor.load_state_dict(state["srl_actor"])
         self.srl_critic1.load_state_dict(state["srl_critic1"])
