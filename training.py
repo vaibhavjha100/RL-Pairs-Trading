@@ -13,10 +13,12 @@ Usage:
     python training.py --agent MPHDRL --epochs 50 --device cuda
     python training.py --agent MPHDRL --epochs 50 --device auto
 
-On CUDA: cudnn benchmark, TF32 for matmul/cudnn, high FP32 matmul precision, and
-non_blocking host→device copies where applicable.
+On CUDA (default): cudnn benchmark, TF32, fast H2D copies, mixed precision (bfloat16
+if supported else float16 + GradScaler), and torch.compile on forward_step unless
+disabled with --no-amp / --no-compile. Same training schedule (epochs, HPARAMS).
 """
 
+import contextlib
 import os
 import sys
 import time
@@ -148,6 +150,38 @@ class MPHDRLTrainer(BaseTrainer):
 
         self.model = MPHDRLTrader(F_dim, n_pairs, n_tickers, data["M"], device=str(self.device))
 
+        # --- Speed (CUDA): AMP + optional torch.compile; same algorithm / epoch count ---
+        self.use_amp = self.device.type == "cuda" and not getattr(args, "no_amp", False)
+        if (
+            self.use_amp
+            and hasattr(torch.cuda, "is_bf16_supported")
+            and torch.cuda.is_bf16_supported()
+        ):
+            self._amp_dtype = torch.bfloat16
+            self._scaler = None  # bf16 rarely needs GradScaler on recent CUDA
+        elif self.use_amp:
+            self._amp_dtype = torch.float16
+            self._scaler = torch.amp.GradScaler("cuda", enabled=True)
+        else:
+            self._amp_dtype = torch.float32
+            self._scaler = None
+
+        if self.device.type == "cuda" and not getattr(args, "no_compile", False) and hasattr(
+            torch, "compile"
+        ):
+            try:
+                self.model.forward_step = torch.compile(
+                    self.model.forward_step,
+                    mode="default",
+                    fullgraph=False,
+                )
+                self._forward_compiled = True
+            except Exception as e:
+                print(f"[training] torch.compile skipped: {e}")
+                self._forward_compiled = False
+        else:
+            self._forward_compiled = False
+
         self.env = TradingEnvironment(
             pairs=data["pairs"],
             tickers=data["tickers"],
@@ -171,6 +205,11 @@ class MPHDRLTrainer(BaseTrainer):
         )
 
         self._build_optimizers()
+
+    def _autocast(self):
+        if self.use_amp:
+            return torch.amp.autocast("cuda", dtype=self._amp_dtype)
+        return contextlib.nullcontext()
 
     def _h2d(self, arr, dtype=torch.float32):
         """Numpy (or array-like) → model device; pin_memory + non_blocking on CUDA only."""
@@ -212,7 +251,8 @@ class MPHDRLTrainer(BaseTrainer):
         while True:
             windows, mask, y_spread = state_info
             with torch.no_grad():
-                step_out = self.model.forward_step(windows, explore=True)
+                with self._autocast():
+                    step_out = self.model.forward_step(windows, explore=True)
 
             w_np = step_out["weights"].detach().cpu().numpy().flatten()
             actions_np = step_out["actions"].detach().cpu().numpy().flatten()
@@ -265,107 +305,137 @@ class MPHDRLTrainer(BaseTrainer):
 
         # -- Target actions (smoothed) --
         with torch.no_grad():
-            h_next_actor = self.model.encode_all_pairs(nsw, self.model.srl_actor_target)
-            Bp, P, H = h_next_actor.shape
-            next_logits = self.model.actor_target(h_next_actor.reshape(Bp * P, H))
-            noise = torch.randn_like(next_logits) * HPARAMS["sigma_smooth"]
-            noise = noise.clamp(-HPARAMS["clip_smooth"], HPARAMS["clip_smooth"])
-            next_probs = F.softmax(next_logits + noise, dim=-1)
-            next_acts = next_probs.argmax(dim=-1).reshape(Bp, P)
-            next_acts_oh = F.one_hot(next_acts, num_classes=3).float()
+            with self._autocast():
+                h_next_actor = self.model.encode_all_pairs(nsw, self.model.srl_actor_target)
+                Bp, P, H = h_next_actor.shape
+                next_logits = self.model.actor_target(h_next_actor.reshape(Bp * P, H))
+                noise = torch.randn_like(next_logits) * HPARAMS["sigma_smooth"]
+                noise = noise.clamp(-HPARAMS["clip_smooth"], HPARAMS["clip_smooth"])
+                next_probs = F.softmax(next_logits + noise, dim=-1)
+                next_acts = next_probs.argmax(dim=-1).reshape(Bp, P)
+                next_acts_oh = F.one_hot(next_acts, num_classes=3).float()
 
-            h_nc1 = self.model.encode_all_pairs(nsw, self.model.srl_critic1_target)
-            h_nc2 = self.model.encode_all_pairs(nsw, self.model.srl_critic2_target)
-            q1_next = self.model.critic1_target(h_nc1.mean(dim=1), next_acts_oh.reshape(Bp, -1))
-            q2_next = self.model.critic2_target(h_nc2.mean(dim=1), next_acts_oh.reshape(Bp, -1))
-            y_critic = rews + discount_gamma * torch.min(q1_next, q2_next)
+                h_nc1 = self.model.encode_all_pairs(nsw, self.model.srl_critic1_target)
+                h_nc2 = self.model.encode_all_pairs(nsw, self.model.srl_critic2_target)
+                q1_next = self.model.critic1_target(h_nc1.mean(dim=1), next_acts_oh.reshape(Bp, -1))
+                q2_next = self.model.critic2_target(h_nc2.mean(dim=1), next_acts_oh.reshape(Bp, -1))
+                y_critic = rews + discount_gamma * torch.min(q1_next, q2_next)
 
         # -- Critic 1 update --
-        h_c1 = self.model.encode_all_pairs(sw, self.model.srl_critic1)
-        q1 = self.model.critic1(h_c1.mean(dim=1), acts_onehot.reshape(B, -1))
-        td1 = y_critic - q1
-        loss_c1 = (is_weights * td1.pow(2)).mean()
+        with self._autocast():
+            h_c1 = self.model.encode_all_pairs(sw, self.model.srl_critic1)
+            q1 = self.model.critic1(h_c1.mean(dim=1), acts_onehot.reshape(B, -1))
+            td1 = y_critic - q1
+            loss_c1 = (is_weights * td1.pow(2)).mean()
         self.opt_critic1.zero_grad()
-        loss_c1.backward()
-        self.opt_critic1.step()
+        if self._scaler is not None:
+            self._scaler.scale(loss_c1).backward()
+            self._scaler.step(self.opt_critic1)
+        else:
+            loss_c1.backward()
+            self.opt_critic1.step()
 
         # -- Critic 2 update --
-        h_c2 = self.model.encode_all_pairs(sw, self.model.srl_critic2)
-        q2 = self.model.critic2(h_c2.mean(dim=1), acts_onehot.reshape(B, -1))
-        td2 = y_critic - q2
-        loss_c2 = (is_weights * td2.pow(2)).mean()
+        with self._autocast():
+            h_c2 = self.model.encode_all_pairs(sw, self.model.srl_critic2)
+            q2 = self.model.critic2(h_c2.mean(dim=1), acts_onehot.reshape(B, -1))
+            td2 = y_critic - q2
+            loss_c2 = (is_weights * td2.pow(2)).mean()
         self.opt_critic2.zero_grad()
-        loss_c2.backward()
-        self.opt_critic2.step()
+        if self._scaler is not None:
+            self._scaler.scale(loss_c2).backward()
+            self._scaler.step(self.opt_critic2)
+        else:
+            loss_c2.backward()
+            self.opt_critic2.step()
 
         min_td = torch.min(td1.abs(), td2.abs()).detach().cpu().numpy()
         self.replay.update_priorities(indices, min_td)
 
         # -- Stop-loss update (DDQN) --
         with torch.no_grad():
-            h_ns_stop = self.model.encode_all_pairs(nsw, self.model.srl_stop_target)
-            h_ns_stop_online = self.model.encode_all_pairs(nsw, self.model.srl_stop)
-            Bp2, P2, Hs = h_ns_stop.shape
-            q_next_online = self.model.stop_loss(h_ns_stop_online.reshape(Bp2 * P2, Hs))
-            best_sl_next = q_next_online.argmax(dim=-1)
-            q_next_target = self.model.stop_loss_target(h_ns_stop.reshape(Bp2 * P2, Hs))
-            q_sl_target_vals = q_next_target.gather(1, best_sl_next.unsqueeze(1)).squeeze(1)
-            q_sl_target_vals = q_sl_target_vals.reshape(Bp2, P2)
-            rews_expanded = rews.unsqueeze(1).expand_as(q_sl_target_vals)
-            y_sl = rews_expanded + discount_gamma * q_sl_target_vals
+            with self._autocast():
+                h_ns_stop = self.model.encode_all_pairs(nsw, self.model.srl_stop_target)
+                h_ns_stop_online = self.model.encode_all_pairs(nsw, self.model.srl_stop)
+                Bp2, P2, Hs = h_ns_stop.shape
+                q_next_online = self.model.stop_loss(h_ns_stop_online.reshape(Bp2 * P2, Hs))
+                best_sl_next = q_next_online.argmax(dim=-1)
+                q_next_target = self.model.stop_loss_target(h_ns_stop.reshape(Bp2 * P2, Hs))
+                q_sl_target_vals = q_next_target.gather(1, best_sl_next.unsqueeze(1)).squeeze(1)
+                q_sl_target_vals = q_sl_target_vals.reshape(Bp2, P2)
+                rews_expanded = rews.unsqueeze(1).expand_as(q_sl_target_vals)
+                y_sl = rews_expanded + discount_gamma * q_sl_target_vals
 
-        h_s_stop = self.model.encode_all_pairs(sw, self.model.srl_stop)
-        q_sl = self.model.stop_loss(h_s_stop.reshape(B * self.n_pairs, -1))
-        sls_flat = sls.reshape(B * self.n_pairs)
-        q_sl_selected = q_sl.gather(1, sls_flat.unsqueeze(1)).squeeze(1).reshape(B, self.n_pairs)
-        loss_sl = F.mse_loss(q_sl_selected, y_sl)
+        with self._autocast():
+            h_s_stop = self.model.encode_all_pairs(sw, self.model.srl_stop)
+            q_sl = self.model.stop_loss(h_s_stop.reshape(B * self.n_pairs, -1))
+            sls_flat = sls.reshape(B * self.n_pairs)
+            q_sl_selected = q_sl.gather(1, sls_flat.unsqueeze(1)).squeeze(1).reshape(B, self.n_pairs)
+            loss_sl = F.mse_loss(q_sl_selected, y_sl)
         self.opt_stop.zero_grad()
-        loss_sl.backward()
-        self.opt_stop.step()
+        if self._scaler is not None:
+            self._scaler.scale(loss_sl).backward()
+            self._scaler.step(self.opt_stop)
+        else:
+            loss_sl.backward()
+            self.opt_stop.step()
 
         losses = {"critic1": loss_c1.item(), "critic2": loss_c2.item(), "stop_loss": loss_sl.item()}
 
         # -- Delayed actor + portfolio + regression update --
         delay = MPHDRLTrader.dynamic_delay(epoch)
         if step_in_epoch % delay == 0:
-            h_a = self.model.encode_all_pairs(sw, self.model.srl_actor)
-            Ba, Pa, Ha = h_a.shape
-            logits_a = self.model.actor(h_a.reshape(Ba * Pa, Ha))
-            probs_a = F.softmax(logits_a, dim=-1)
-            # Differentiable policy signal: expected soft action (§5.3, §8.3 spirit).
-            # Critics are trained on stored one-hot actions; actor step uses soft probs.
-            soft_actions = probs_a.reshape(Ba, Pa * 3)
+            with self._autocast():
+                h_a = self.model.encode_all_pairs(sw, self.model.srl_actor)
+                Ba, Pa, Ha = h_a.shape
+                logits_a = self.model.actor(h_a.reshape(Ba * Pa, Ha))
+                probs_a = F.softmax(logits_a, dim=-1)
+                # Differentiable policy signal: expected soft action (§5.3, §8.3 spirit).
+                # Critics are trained on stored one-hot actions; actor step uses soft probs.
+                soft_actions = probs_a.reshape(Ba, Pa * 3)
 
-            h_c1_for_actor = self.model.encode_all_pairs(sw, self.model.srl_critic1)
-            q_for_actor = self.model.critic1(h_c1_for_actor.mean(dim=1), soft_actions)
-            loss_actor_pg = -q_for_actor.mean()
+                h_c1_for_actor = self.model.encode_all_pairs(sw, self.model.srl_critic1)
+                q_for_actor = self.model.critic1(h_c1_for_actor.mean(dim=1), soft_actions)
+                loss_actor_pg = -q_for_actor.mean()
 
-            # Regression loss (§1.4, §8.5): per-pair label from same row as state window.
-            spread_pred = self.model.regression_head(h_a.reshape(Ba * Pa, Ha)).reshape(Ba, Pa)
-            y_batch = self._h2d(
-                np.stack(
-                    [t.get("y_spread", np.zeros(self.n_pairs, dtype=np.float32)) for t in batch]
+                # Regression loss (§1.4, §8.5): per-pair label from same row as state window.
+                spread_pred = self.model.regression_head(h_a.reshape(Ba * Pa, Ha)).reshape(Ba, Pa)
+                y_batch = self._h2d(
+                    np.stack(
+                        [t.get("y_spread", np.zeros(self.n_pairs, dtype=np.float32)) for t in batch]
+                    )
                 )
-            )
-            loss_reg = F.mse_loss(spread_pred, y_batch)
+                loss_reg = F.mse_loss(spread_pred, y_batch)
 
-            loss_actor_total = loss_actor_pg + loss_reg
+                loss_actor_total = loss_actor_pg + loss_reg
 
             self.opt_actor.zero_grad()
-            loss_actor_total.backward()
-            self.opt_actor.step()
+            if self._scaler is not None:
+                self._scaler.scale(loss_actor_total).backward()
+                self._scaler.step(self.opt_actor)
+            else:
+                loss_actor_total.backward()
+                self.opt_actor.step()
 
             self.model.soft_update()
 
             losses["actor_pg"] = loss_actor_pg.item()
             losses["regression"] = loss_reg.item()
 
+        if self._scaler is not None:
+            self._scaler.update()
+
         return losses
 
     def train(self):
         print(f"\n{'=' * 60}")
         print(f"Training MPHDRL agent for {self.epochs} epochs")
-        print(f"Device: {self.device} ({self.device.type}) | Pairs: {self.n_pairs}")
+        speed = []
+        if self.device.type == "cuda":
+            speed.append(f"AMP={self._amp_dtype}" if self.use_amp else "AMP=off")
+            speed.append("compile=on" if getattr(self, "_forward_compiled", False) else "compile=off")
+        speed_s = (" | " + ", ".join(speed)) if speed else ""
+        print(f"Device: {self.device} ({self.device.type}) | Pairs: {self.n_pairs}{speed_s}")
         print(f"{'=' * 60}\n")
 
         for epoch in range(1, self.epochs + 1):
@@ -411,6 +481,10 @@ def parse_args():
                         help="Torch device: auto (CUDA>MPS>CPU), cuda, mps, or cpu (default: auto)")
     parser.add_argument("--save-every", type=int, default=10, dest="save_every",
                         help="Save checkpoint every N epochs (default: 10)")
+    parser.add_argument("--no-amp", action="store_true",
+                        help="Disable CUDA mixed precision (default: AMP on when using CUDA)")
+    parser.add_argument("--no-compile", action="store_true",
+                        help="Disable torch.compile on forward_step (default: compile on CUDA)")
     return parser.parse_args()
 
 
@@ -424,6 +498,11 @@ def main():
     print("=" * 60)
     print(f"Agent: {args.agent}")
     print(f"Device: {resolved} (from --device {args.device!r})")
+    if resolved.type == "cuda":
+        print(
+            f"Speed opts: AMP={'off' if args.no_amp else 'on (bf16 or fp16+scaler)'}, "
+            f"torch.compile={'off' if args.no_compile else 'on (forward_step)'}"
+        )
     print("=" * 60)
 
     print("\nChecking data readiness...")
