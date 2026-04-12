@@ -194,6 +194,34 @@ def main():
     except Exception as e:
         logging.error(f"Failed to save CSV {csv_out_path}: {e}")
 
+    # Nifty 50 benchmark index (^NSEI on Yahoo Finance) — simple OHLCV table
+    nifty50_out = os.path.join(trading_dir, "nifty50.csv")
+    logging.info(
+        f"Downloading Nifty 50 index ^NSEI (start='{start_date}', end='{end_date}', interval='1d')..."
+    )
+    try:
+        kwargs = dict(
+            start=start_date,
+            end=end_date,
+            interval="1d",
+            auto_adjust=False,
+            threads=False,
+        )
+        try:
+            idx_df = yf.download("^NSEI", progress=False, **kwargs)
+        except TypeError:
+            idx_df = yf.download("^NSEI", **kwargs)
+        if idx_df is not None and not idx_df.empty:
+            idx_df = idx_df.reset_index()
+            if isinstance(idx_df.columns, pd.MultiIndex):
+                idx_df.columns = [c[0] if isinstance(c, tuple) else c for c in idx_df.columns]
+            idx_df.to_csv(nifty50_out, index=False)
+            logging.info(f"Saved Nifty 50 index series to {nifty50_out}")
+        else:
+            logging.warning("No data returned for ^NSEI; nifty50.csv not written.")
+    except Exception as e:
+        logging.warning(f"Could not download or save ^NSEI to nifty50.csv: {e}")
+
     # 7. Print summary stats, date range, failures list, and dict sample
     print("\n" + "="*50)
     print(" SUMMARY STATISTICS")
