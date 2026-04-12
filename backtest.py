@@ -2,7 +2,7 @@
 backtest.py -- Walk-forward backtesting for MPHDRL, Benchmark RL, and Traditional pairs.
 
 Produces daily gross/net PnL, returns, costs, taxes for each strategy and exports
-CSV files to data/backtest/ for downstream performance comparison.
+CSV files to data/backtest/ for downstream comparison (see comparison.py).
 
 Usage:
     python backtest.py
@@ -70,7 +70,7 @@ RESULT_COLUMNS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Data loading (mirrors test.py load_test_bundle + price pivot)
+# Data loading (mirrors comparison / sequence bundle + price pivot)
 # ---------------------------------------------------------------------------
 
 def load_test_bundle():

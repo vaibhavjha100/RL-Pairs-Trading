@@ -1,0 +1,397 @@
+"""
+comparison.py -- Formal backtest comparison: performance metrics, common-size costs,
+and one-tailed paired Wilcoxon signed-rank tests on daily mean-variance utility (net).
+
+Reads CSVs from backtest.py:
+    data/backtest/mphdrl.csv, benchmark.csv, traditional.csv
+
+Writes:
+    data/backtest/results/comparison_summary.txt
+    data/backtest/results/comparison_metrics.csv
+    data/backtest/results/wilcoxon_utility.json
+
+Requires scipy (Wilcoxon test): pip install scipy
+
+Usage:
+    python comparison.py
+    python comparison.py --backtest-dir data/backtest --results-dir data/backtest/results
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+try:
+    from scipy.stats import wilcoxon
+except ImportError as e:
+    raise SystemExit(
+        "comparison.py requires scipy for Wilcoxon signed-rank tests. "
+        "Install with:  pip install scipy\n"
+        f"Original error: {e}"
+    ) from e
+
+try:
+    from backtest import BACKTEST_DIR, INITIAL_CASH
+except ImportError:
+    BACKTEST_DIR = os.path.join("data", "backtest")
+    INITIAL_CASH = 10_000_000.0
+
+RESULTS_SUBDIR = "results"
+UTILITY_GAMMA = 0.5
+DEFAULT_UTILITY_WINDOW = 60
+
+STRATEGY_FILES = (
+    ("MPHDRL", "mphdrl.csv"),
+    ("Benchmark RL", "benchmark.csv"),
+    ("Traditional pairs", "traditional.csv"),
+)
+
+
+def utility_definition_text(window: int, gamma: float) -> str:
+    return (
+        f"Daily net utility U_t on trailing {window} trading days (inclusive of t): "
+        f"R_ann(t)=mean(r_{t-window+1:t})*252, Var_ann(t)=var(r,ddof=1)*252 on same window, "
+        f"U_t=R_ann(t)-0.5*{gamma}*Var_ann(t), with r_t=net_portfolio_return."
+    )
+
+
+def max_drawdown(equity: np.ndarray) -> float:
+    if equity.size == 0:
+        return 0.0
+    peak = np.maximum.accumulate(equity.astype(float))
+    peak = np.where(peak < 1e-12, np.nan, peak)
+    dd = (peak - equity.astype(float)) / peak
+    return float(np.nanmax(dd)) if np.any(np.isfinite(dd)) else 0.0
+
+
+def annualized_sharpe(daily_returns: np.ndarray, rf_daily: float = 0.0) -> float:
+    r = np.asarray(daily_returns, dtype=float).ravel()
+    r = r[np.isfinite(r)]
+    if r.size < 2:
+        return 0.0
+    excess = r - rf_daily
+    mu = float(np.nanmean(excess))
+    sig = float(np.nanstd(excess, ddof=1))
+    if sig < 1e-12:
+        return 0.0
+    return float(np.sqrt(252.0) * mu / sig)
+
+
+def annualized_mean_return(daily_returns: np.ndarray) -> float:
+    r = np.asarray(daily_returns, dtype=float).ravel()
+    r = r[np.isfinite(r)]
+    if r.size < 1:
+        return 0.0
+    return float(np.nanmean(r)) * 252.0
+
+
+def annualized_variance_returns(daily_returns: np.ndarray) -> float:
+    r = np.asarray(daily_returns, dtype=float).ravel()
+    r = r[np.isfinite(r)]
+    if r.size < 2:
+        return 0.0
+    return float(np.nanvar(r, ddof=1)) * 252.0
+
+
+def mean_variance_utility_ann(
+    daily_returns: np.ndarray, gamma: float = UTILITY_GAMMA
+) -> tuple[float, float, float]:
+    r_ann = annualized_mean_return(daily_returns)
+    v_ann = annualized_variance_returns(daily_returns)
+    u = r_ann - 0.5 * v_ann * gamma
+    return u, r_ann, v_ann
+
+
+def rolling_daily_net_utility(
+    df: pd.DataFrame, window: int, gamma: float
+) -> pd.Series:
+    """U_t from trailing net returns; index = date. NaN until min_periods met."""
+    d = df.sort_values("date").reset_index(drop=True)
+    r = d["net_portfolio_return"].astype(float)
+    r_ann = r.rolling(window=window, min_periods=2).mean() * 252.0
+    v_ann = r.rolling(window=window, min_periods=2).var(ddof=1) * 252.0
+    u = r_ann - 0.5 * gamma * v_ann
+    idx = pd.to_datetime(d["date"])
+    return pd.Series(u.values, index=idx)
+
+
+def load_strategy_csv(base_dir: str, filename: str) -> pd.DataFrame | None:
+    path = os.path.join(base_dir, filename)
+    if not os.path.isfile(path):
+        return None
+    return pd.read_csv(path, parse_dates=["date"])
+
+
+def summarize(df: pd.DataFrame, name: str) -> dict[str, Any]:
+    if df is None or df.empty:
+        return {"strategy": name, "ok": False}
+
+    g_end = float(df["gross_portfolio_value"].iloc[-1])
+    n_end = float(df["net_portfolio_value"].iloc[-1])
+    gross_ret_total = (g_end - INITIAL_CASH) / INITIAL_CASH * 100.0
+    net_ret_total = (n_end - INITIAL_CASH) / INITIAL_CASH * 100.0
+    gross_dd = max_drawdown(df["gross_portfolio_value"].values)
+    net_dd = max_drawdown(df["net_portfolio_value"].values)
+
+    txn = float(df["transaction_cost"].sum())
+    short_c = float(df["shorting_cost"].sum())
+    tax_net = float(-df["tax_flow"].sum())
+
+    g_vol = (
+        float(np.nanstd(df["gross_portfolio_return"].values) * np.sqrt(252))
+        if len(df) > 1
+        else 0.0
+    )
+    n_vol = (
+        float(np.nanstd(df["net_portfolio_return"].values) * np.sqrt(252))
+        if len(df) > 1
+        else 0.0
+    )
+
+    g_sharpe = annualized_sharpe(df["gross_portfolio_return"].values)
+    n_sharpe = annualized_sharpe(df["net_portfolio_return"].values)
+    g_u, _, _ = mean_variance_utility_ann(df["gross_portfolio_return"].values)
+    n_u, _, _ = mean_variance_utility_ann(df["net_portfolio_return"].values)
+
+    mean_gpv = float(df["gross_portfolio_value"].mean())
+
+    return {
+        "strategy": name,
+        "ok": True,
+        "n_days": len(df),
+        "start_date": df["date"].iloc[0].isoformat(),
+        "end_date": df["date"].iloc[-1].isoformat(),
+        "gross_ret_pct": gross_ret_total,
+        "net_ret_pct": net_ret_total,
+        "gross_dd_pct": gross_dd * 100.0,
+        "net_dd_pct": net_dd * 100.0,
+        "gross_ann_vol_pct": g_vol * 100.0,
+        "net_ann_vol_pct": n_vol * 100.0,
+        "gross_sharpe": g_sharpe,
+        "net_sharpe": n_sharpe,
+        "gross_end_inr": g_end,
+        "net_end_inr": n_end,
+        "sum_txn_inr": txn,
+        "sum_short_inr": short_c,
+        "sum_tax_inr": tax_net,
+        "txn_pct_initial_cash": txn / INITIAL_CASH * 100.0,
+        "short_pct_initial_cash": short_c / INITIAL_CASH * 100.0,
+        "tax_pct_initial_cash": tax_net / INITIAL_CASH * 100.0,
+        "total_costs_pct_initial_cash": (txn + short_c + tax_net) / INITIAL_CASH * 100.0,
+        "costs_bps_per_year_of_mean_gross_pv": (
+            (txn + short_c + tax_net) / max(mean_gpv, 1.0) / max(len(df) / 252.0, 1e-9) * 10000.0
+        ),
+        "scalar_gross_util_ann": g_u,
+        "scalar_net_util_ann": n_u,
+    }
+
+
+def run_wilcoxon_mphdrl_greater(
+    u_mph: pd.Series,
+    u_bench: pd.Series,
+    label_bench: str,
+) -> dict[str, Any]:
+    """Paired differences MPHDRL - bench; H1: median > 0."""
+    j = pd.DataFrame({"mph": u_mph, "bench": u_bench}).dropna()
+    if len(j) < 3:
+        return {
+            "benchmark": label_bench,
+            "n_pairs": int(len(j)),
+            "error": "insufficient paired observations (need >= 3)",
+        }
+    d = (j["mph"] - j["bench"]).values.astype(float)
+    d = d[np.isfinite(d)]
+    if d.size < 3:
+        return {
+            "benchmark": label_bench,
+            "n_pairs": int(d.size),
+            "error": "insufficient finite differences",
+        }
+    try:
+        try:
+            res = wilcoxon(d, alternative="greater", zero_method="wilcox", method="auto")
+        except TypeError:
+            res = wilcoxon(d, alternative="greater", zero_method="wilcox")
+    except ValueError as e:
+        return {
+            "benchmark": label_bench,
+            "n_pairs": int(d.size),
+            "error": str(e),
+        }
+    return {
+        "benchmark": label_bench,
+        "n_pairs": int(d.size),
+        "alternative": "greater",
+        "zero_method": "wilcox",
+        "statistic": float(res.statistic) if res.statistic is not None else None,
+        "pvalue": float(res.pvalue) if res.pvalue is not None else None,
+    }
+
+
+def build_report(
+    summaries: list[dict[str, Any]],
+    wilcox_rows: list[dict[str, Any]],
+    window: int,
+    gamma: float,
+) -> str:
+    lines: list[str] = []
+    lines.append("=" * 88)
+    lines.append("FORMAL BACKTEST COMPARISON")
+    lines.append(f"Initial cash: {INITIAL_CASH:,.0f} INR")
+    lines.append("=" * 88)
+    lines.append("")
+    lines.append("--- Summary performance ---")
+    hdr = (
+        f"{'Strategy':<18} {'Days':>5} {'Net ret%':>9} {'Gross vol%':>11} {'Net vol%':>9} "
+        f"{'Net Sharpe':>10} {'Net end (M)':>12}"
+    )
+    lines.append(hdr)
+    lines.append("-" * len(hdr))
+    for s in summaries:
+        if not s.get("ok"):
+            continue
+        lines.append(
+            f"{s['strategy']:<18} {s['n_days']:>5d} {s['net_ret_pct']:>+8.2f}% "
+            f"{s['gross_ann_vol_pct']:>10.2f}% {s['net_ann_vol_pct']:>8.2f}% "
+            f"{s['net_sharpe']:>10.3f} {s['net_end_inr']/1e6:>12.3f}"
+        )
+    lines.append("")
+    lines.append("--- Scalar mean-variance utility (full sample, net), gamma={} ---".format(gamma))
+    lines.append("U = R_ann - 0.5 * Var_ann * gamma on all net daily returns.")
+    for s in summaries:
+        if s.get("ok"):
+            lines.append(f"  {s['strategy']}: U_net = {s['scalar_net_util_ann']:.6f}")
+    lines.append("")
+    lines.append("--- Common-size costs (% of initial cash) ---")
+    hdr2 = f"{'Strategy':<18} {'Txn%':>8} {'Short%':>8} {'Tax%':>8} {'Total%':>8} {'Bps/yr*':>10}"
+    lines.append(hdr2)
+    lines.append("-" * len(hdr2))
+    lines.append("* Total txn+short+tax relative to mean gross PV, annualized bps (see JSON).")
+    for s in summaries:
+        if not s.get("ok"):
+            continue
+        lines.append(
+            f"{s['strategy']:<18} {s['txn_pct_initial_cash']:>7.3f}% "
+            f"{s['short_pct_initial_cash']:>7.3f}% {s['tax_pct_initial_cash']:>7.3f}% "
+            f"{s['total_costs_pct_initial_cash']:>7.3f}% {s['costs_bps_per_year_of_mean_gross_pv']:>10.1f}"
+        )
+    lines.append("")
+    lines.append("--- Wilcoxon signed-rank (paired, one-tailed) ---")
+    lines.append(utility_definition_text(window, gamma))
+    lines.append("H0: median(U_MPHDRL - U_benchmark) <= 0  vs  H1: median > 0.")
+    lines.append("")
+    for w in wilcox_rows:
+        lines.append(f"  vs {w.get('benchmark', '?')}:")
+        if "error" in w:
+            lines.append(f"    {w['error']} (n={w.get('n_pairs', 0)})")
+        else:
+            lines.append(
+                f"    n={w['n_pairs']}, statistic={w.get('statistic')}, p-value={w.get('pvalue')}"
+            )
+    lines.append("")
+    lines.append("=" * 88)
+    return "\n".join(lines) + "\n"
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Formal backtest comparison and Wilcoxon tests")
+    p.add_argument("--backtest-dir", type=str, default=BACKTEST_DIR, help="Directory with strategy CSVs")
+    p.add_argument(
+        "--results-dir",
+        type=str,
+        default=None,
+        help="Output directory (default: <backtest-dir>/results)",
+    )
+    p.add_argument("--utility-window", type=int, default=DEFAULT_UTILITY_WINDOW, help="Trailing days for U_t")
+    p.add_argument("--gamma", type=float, default=UTILITY_GAMMA, help="Risk aversion in U_t")
+    args = p.parse_args()
+
+    base = args.backtest_dir
+    results_dir = args.results_dir or os.path.join(base, RESULTS_SUBDIR)
+    window = int(args.utility_window)
+    gamma = float(args.gamma)
+
+    loaded: dict[str, pd.DataFrame] = {}
+    summaries: list[dict[str, Any]] = []
+    for name, fname in STRATEGY_FILES:
+        df = load_strategy_csv(base, fname)
+        if df is None:
+            print(f"Missing: {os.path.join(base, fname)}", file=sys.stderr)
+            summaries.append({"strategy": name, "ok": False})
+        else:
+            loaded[name] = df
+            summaries.append(summarize(df, name))
+
+    if not all(s.get("ok") for s in summaries):
+        print("All three backtest CSVs are required. Run:  python backtest.py", file=sys.stderr)
+        sys.exit(1)
+
+    df_mph = loaded["MPHDRL"].sort_values("date").reset_index(drop=True)
+    df_bench = loaded["Benchmark RL"].sort_values("date").reset_index(drop=True)
+    df_trad = loaded["Traditional pairs"].sort_values("date").reset_index(drop=True)
+
+    u_mph = rolling_daily_net_utility(df_mph, window, gamma)
+    u_bench = rolling_daily_net_utility(df_bench, window, gamma)
+    u_trad = rolling_daily_net_utility(df_trad, window, gamma)
+
+    common = (
+        df_mph[["date"]]
+        .merge(df_bench[["date"]], on="date")
+        .merge(df_trad[["date"]], on="date")
+        .sort_values("date")
+    )
+    dates = pd.to_datetime(common["date"]).values
+
+    s_mph = u_mph.reindex(dates).values
+    s_bench = u_bench.reindex(dates).values
+    s_trad = u_trad.reindex(dates).values
+
+    ser_mph = pd.Series(s_mph, index=dates)
+    ser_bench = pd.Series(s_bench, index=dates)
+    ser_trad = pd.Series(s_trad, index=dates)
+
+    wilcox_rows = [
+        run_wilcoxon_mphdrl_greater(ser_mph, ser_bench, "Benchmark RL"),
+        run_wilcoxon_mphdrl_greater(ser_mph, ser_trad, "Traditional pairs"),
+    ]
+
+    util_def = utility_definition_text(window, gamma)
+    wilcox_json = {
+        "utility_definition": util_def,
+        "gamma": gamma,
+        "window": window,
+        "tests": wilcox_rows,
+    }
+
+    report = build_report(summaries, wilcox_rows, window, gamma)
+    print(report, end="")
+
+    os.makedirs(results_dir, exist_ok=True)
+    summary_path = os.path.join(results_dir, "comparison_summary.txt")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write(report)
+    print(f"Wrote: {os.path.abspath(summary_path)}")
+
+    metrics_path = os.path.join(results_dir, "comparison_metrics.csv")
+    ok_sum = [s for s in summaries if s.get("ok")]
+    metrics_df = pd.DataFrame(ok_sum)
+    if "ok" in metrics_df.columns:
+        metrics_df = metrics_df.drop(columns=["ok"])
+    metrics_df.to_csv(metrics_path, index=False)
+    print(f"Wrote: {os.path.abspath(metrics_path)}")
+
+    json_path = os.path.join(results_dir, "wilcoxon_utility.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(wilcox_json, f, indent=2)
+    print(f"Wrote: {os.path.abspath(json_path)}")
+
+
+if __name__ == "__main__":
+    main()
