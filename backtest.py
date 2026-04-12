@@ -1,5 +1,5 @@
 """
-backtest.py -- Walk-forward backtesting for MPHDRL, Benchmark RL, Traditional pairs, and Nifty 50 buy-and-hold.
+backtest.py -- Walk-forward backtesting for MPHDRL, Benchmark RL, and Traditional pairs.
 
 Produces daily gross/net PnL, returns, costs, taxes for each strategy and exports
 CSV files to data/backtest/ for downstream performance comparison.
@@ -45,8 +45,6 @@ SHORT_COST_ANNUAL = 0.0657
 SHORT_COST_DAILY = SHORT_COST_ANNUAL / 252
 STCG_RATE = 0.20
 LTCG_RATE = 0.125
-MGMT_FEE_ANNUAL = 0.0022
-MGMT_FEE_DAILY = MGMT_FEE_ANNUAL / 252
 FISCAL_YEAR_END = (3, 31)
 
 BACKTEST_DIR = os.path.join("data", "backtest")
@@ -126,16 +124,6 @@ def load_price_matrix(tickers):
     if missing_t:
         print(f"WARNING: {len(missing_t)} tickers missing from raw.csv: {missing_t[:5]}...")
     return wide
-
-
-def load_nifty50():
-    path = os.path.join("data", "trading", "nifty50.csv")
-    if not os.path.isfile(path):
-        print(f"Missing {path}. Run collection.py first.")
-        sys.exit(1)
-    df = pd.read_csv(path, parse_dates=["Date"])
-    df = df.sort_values("Date").reset_index(drop=True)
-    return df
 
 
 def _default_ckpt(model_dir):
@@ -346,94 +334,6 @@ def run_strategy_backtest(strategy_name, weights_by_date, price_wide, tickers, t
     return df
 
 # ---------------------------------------------------------------------------
-# Nifty 50 buy-and-hold
-# ---------------------------------------------------------------------------
-
-def run_nifty_backtest(nifty_df, test_start, test_end):
-    """
-    Buy at first close in test window, hold daily with mgmt fee,
-    sell at last close with txn cost, LTCG tax retroactively amortized.
-    """
-    mask = (nifty_df["Date"] >= test_start) & (nifty_df["Date"] <= test_end)
-    nf = nifty_df.loc[mask].sort_values("Date").reset_index(drop=True)
-    if len(nf) < 2:
-        print("  Nifty 50: insufficient data in test window.")
-        return pd.DataFrame(columns=RESULT_COLUMNS)
-
-    closes = nf["Close"].values.astype(np.float64)
-    dates = nf["Date"].values
-
-    buy_cost = INITIAL_CASH * TXN_COST_RATE
-    invested = INITIAL_CASH - buy_cost
-    units = invested / closes[0]
-
-    rows = []
-    net_pv = invested
-
-    for i in range(1, len(closes)):
-        prev_close = closes[i - 1]
-        curr_close = closes[i]
-        gross_ret = (curr_close - prev_close) / prev_close if prev_close else 0.0
-        gross_pnl = net_pv * gross_ret
-        gross_pv = net_pv + gross_pnl
-
-        mgmt_cost = gross_pv * MGMT_FEE_DAILY
-        net_pnl = gross_pnl - mgmt_cost
-        net_ret = net_pnl / net_pv if net_pv else 0.0
-        net_pv += net_pnl
-
-        txn_cost_day = buy_cost if i == 1 else 0.0
-
-        rows.append({
-            "date": pd.Timestamp(dates[i]),
-            "gross_portfolio_value": gross_pv,
-            "gross_long_pnl": gross_pnl,
-            "gross_short_pnl": 0.0,
-            "gross_long_return": gross_ret,
-            "gross_short_return": 0.0,
-            "gross_portfolio_return": gross_ret,
-            "transaction_cost": txn_cost_day + mgmt_cost,
-            "shorting_cost": 0.0,
-            "tax_flow": 0.0,
-            "tax_carryforward": 0.0,
-            "net_long_pnl": net_pnl,
-            "net_short_pnl": 0.0,
-            "net_long_return": net_ret,
-            "net_short_return": 0.0,
-            "net_portfolio_value": net_pv,
-            "net_portfolio_return": net_ret,
-        })
-
-    sell_cost = net_pv * TXN_COST_RATE
-    pv_before_sell = net_pv
-    net_pv -= sell_cost
-    if rows:
-        rows[-1]["transaction_cost"] += sell_cost
-        rows[-1]["net_long_pnl"] -= sell_cost
-        rows[-1]["net_portfolio_value"] = net_pv
-        rows[-1]["net_long_return"] = rows[-1]["net_long_pnl"] / pv_before_sell if pv_before_sell else 0.0
-        rows[-1]["net_portfolio_return"] = rows[-1]["net_long_return"]
-
-    total_profit = net_pv - INITIAL_CASH
-    n_days = len(rows)
-    if total_profit > 0 and n_days > 0:
-        ltcg_tax = total_profit * LTCG_RATE
-        daily_tax = ltcg_tax / n_days
-        for row in rows:
-            row["tax_flow"] = -daily_tax
-            row["net_long_pnl"] -= daily_tax
-        running_pv = INITIAL_CASH - buy_cost
-        for row in rows:
-            running_pv += row["net_long_pnl"]
-            row["net_portfolio_value"] = running_pv
-            row["net_portfolio_return"] = row["net_long_pnl"] / max(running_pv - row["net_long_pnl"], 1.0)
-            row["net_long_return"] = row["net_portfolio_return"]
-
-    df = pd.DataFrame(rows, columns=RESULT_COLUMNS)
-    print(f"  Nifty 50 B&H: {len(df)} trading days simulated")
-    return df
-
-# ---------------------------------------------------------------------------
 # CLI + main
 # ---------------------------------------------------------------------------
 
@@ -485,9 +385,6 @@ def main():
     valid_dates = [d for d in test_dates if d in price_wide.index]
     print(f"Test dates with price data: {len(valid_dates)}")
 
-    # --- Load Nifty 50 ---
-    nifty_df = load_nifty50()
-
     # --- Load models ---
     mphdrl_ckpt = args.mphdrl_ckpt or _default_ckpt(MPHDRL_MODEL_DIR)
     bench_ckpt = args.bench_ckpt or _default_ckpt(BENCHMARK_MODEL_DIR)
@@ -516,7 +413,7 @@ def main():
     print(f"Benchmark checkpoint: {os.path.abspath(bench_ckpt)}")
     print(f"Initial cash: {INITIAL_CASH:,.0f} INR")
     print(f"Txn cost: {TXN_COST_RATE*100:.5f}%  |  Short cost: {SHORT_COST_ANNUAL*100:.2f}% ann.")
-    print(f"STCG: {STCG_RATE*100:.0f}%  |  LTCG: {LTCG_RATE*100:.1f}%  |  Mgmt fee: {MGMT_FEE_ANNUAL*100:.2f}% ann.")
+    print(f"STCG: {STCG_RATE*100:.0f}%  |  LTCG: {LTCG_RATE*100:.1f}%")
     print()
 
     # --- Extract weights for all test dates ---
@@ -556,16 +453,11 @@ def main():
         "Traditional pairs", trad_weights, price_wide, tickers, valid_dates,
     )
 
-    test_start = pd.Timestamp(valid_dates[0]) if valid_dates else pd.Timestamp("2024-01-01")
-    test_end = pd.Timestamp(valid_dates[-1]) if valid_dates else pd.Timestamp("2025-12-31")
-    df_nifty = run_nifty_backtest(nifty_df, test_start, test_end)
-
     # --- Export ---
     for name, df in [
         ("mphdrl", df_mphdrl),
         ("benchmark", df_bench),
         ("traditional", df_trad),
-        ("nifty50", df_nifty),
     ]:
         out_path = os.path.join(BACKTEST_DIR, f"{name}.csv")
         df.to_csv(out_path, index=False)
@@ -579,7 +471,6 @@ def main():
         ("MPHDRL", df_mphdrl),
         ("Benchmark RL", df_bench),
         ("Traditional pairs", df_trad),
-        ("Nifty 50 B&H", df_nifty),
     ]:
         if df.empty:
             print(f"  {label}: no data")
