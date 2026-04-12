@@ -1,9 +1,11 @@
 """
-traditional.py -- Classical mean-reversion pairs trading (beta-hedged); params for backtest traditional.csv.
+traditional.py -- Classical mean-reversion pairs trading (beta-hedged); fixed rules for backtest traditional.csv.
 
 Uses close spread from data/spread/raw.csv and hedge ratios from data/pickle/hedge_ratios.pkl.
-Fits entry/exit/lookback on the pre-split training period (same cut as backtest.load_test_bundle),
-saves data/pickle/traditional_params.pkl for use in backtest.py.
+Hyperparameters are fixed constants (no grid search / training optimization).
+
+Optional: python traditional.py [--out path] writes the same fixed dict to a pickle for inspection
+or for resolve_traditional_params() to merge overrides from file.
 
 Usage:
     python traditional.py
@@ -19,14 +21,50 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-SPLIT_DATE = pd.Timestamp("2024-01-01")
 PICKLE_DIR = os.path.join("data", "pickle")
 SPREAD_DIR = os.path.join("data", "spread")
 TRADITIONAL_PARAMS_PATH = os.path.join(PICKLE_DIR, "traditional_params.pkl")
 SPREAD_RAW_PATH = os.path.join(SPREAD_DIR, "raw.csv")
-HEDGE_PATH = os.path.join(PICKLE_DIR, "hedge_ratios.pkl")
-PAIRS_PATH = os.path.join(PICKLE_DIR, "cointegrated_pairs.pkl")
-PRICE_RAW_PATH = os.path.join("data", "trading", "raw.csv")
+
+# Fixed mean-reversion bands (rolling z on spread; hysteresis z_exit < z_entry).
+DEFAULT_LOOKBACK = 60
+DEFAULT_Z_ENTRY = 2.0
+DEFAULT_Z_EXIT = 0
+
+
+def default_traditional_params() -> dict[str, Any]:
+    """Fixed strategy parameters (no optimization)."""
+    return {
+        "lookback": DEFAULT_LOOKBACK,
+        "z_entry": DEFAULT_Z_ENTRY,
+        "z_exit": DEFAULT_Z_EXIT,
+    }
+
+
+def resolve_traditional_params(path: str | None = None) -> dict[str, Any]:
+    """
+    Strategy params for weight construction: defaults, optionally overridden by a pickle
+    with keys lookback, z_entry, z_exit (other keys ignored).
+    """
+    base = default_traditional_params()
+    path = path or TRADITIONAL_PARAMS_PATH
+    if path and os.path.isfile(path):
+        with open(path, "rb") as f:
+            loaded = pickle.load(f)
+        for k in ("lookback", "z_entry", "z_exit"):
+            if k in loaded:
+                base[k] = loaded[k]
+    return base
+
+
+def save_traditional_params(out_path: str | None = None) -> dict[str, Any]:
+    """Write fixed default parameters to pickle (optional convenience)."""
+    out_path = out_path or TRADITIONAL_PARAMS_PATH
+    params = default_traditional_params()
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "wb") as f:
+        pickle.dump(params, f)
+    return params
 
 
 def build_pair_ticker_mapping(
@@ -171,125 +209,6 @@ def compute_exposure_matrix(
     return E_all
 
 
-def _train_sharpe_from_E(
-    calendar: list[pd.Timestamp],
-    E_all: np.ndarray,
-    M_hedge: np.ndarray,
-    price_wide: pd.DataFrame,
-    tickers: list[str],
-    split_date: pd.Timestamp,
-) -> float:
-    """Daily returns w_t * r_{t->t+1} on train dates only (both t and t+1 < split optional: t < split)."""
-    rets: list[float] = []
-    for i in range(len(calendar) - 1):
-        d0 = calendar[i]
-        d1 = calendar[i + 1]
-        if d0 >= split_date:
-            break
-        if d1 >= split_date:
-            break
-        if d0 not in price_wide.index or d1 not in price_wide.index:
-            continue
-        w = exposures_to_weights_np(E_all[i], M_hedge)
-        p0 = price_wide.loc[d0, tickers].values.astype(np.float64)
-        p1 = price_wide.loc[d1, tickers].values.astype(np.float64)
-        safe = np.where(np.abs(p0) < 1e-12, 1.0, p0)
-        r = (p1 - p0) / safe
-        if not np.all(np.isfinite(r)):
-            continue
-        rets.append(float(np.nansum(w * r)))
-    if len(rets) < 3:
-        return float("-inf")
-    arr = np.asarray(rets, dtype=np.float64)
-    mu = float(np.mean(arr))
-    sig = float(np.std(arr, ddof=1))
-    if sig < 1e-12:
-        return float("-inf")
-    return float(np.sqrt(252.0) * mu / sig)
-
-
-def fit_traditional_params(
-    split_date: pd.Timestamp | None = None,
-    out_path: str | None = None,
-) -> dict[str, Any]:
-    """
-    Grid search on training period; write pickle with best hyperparameters.
-    """
-    split_date = split_date or SPLIT_DATE
-    out_path = out_path or TRADITIONAL_PARAMS_PATH
-
-    with open(PAIRS_PATH, "rb") as f:
-        pairs: list[tuple[str, str]] = pickle.load(f)
-    with open(HEDGE_PATH, "rb") as f:
-        hedge_ratios: dict[tuple[str, str], float] = pickle.load(f)
-
-    _, tickers, ticker_to_idx = build_pair_ticker_mapping(pairs)
-    M_hedge = build_M_hedge(pairs, hedge_ratios, ticker_to_idx)
-    pair_keys = [f"{a}|{b}" for a, b in pairs]
-
-    if not os.path.isfile(SPREAD_RAW_PATH):
-        raise FileNotFoundError(SPREAD_RAW_PATH)
-    raw_sp = pd.read_csv(SPREAD_RAW_PATH, parse_dates=["Date"])
-    spread_wide = raw_sp.pivot(index="Date", columns="Pair", values="spread").sort_index()
-
-    price_wide = pd.read_csv(PRICE_RAW_PATH, parse_dates=["Date"])
-    price_wide = price_wide.pivot(index="Date", columns="Ticker", values="Close").sort_index()
-
-    calendar = [pd.Timestamp(d) for d in spread_wide.index if d in price_wide.index]
-    calendar = sorted(set(calendar))
-
-    best: dict[str, Any] | None = None
-    best_score = float("-inf")
-
-    # Moderate grid: full factorial is slow on many pairs; extend here if needed.
-    L_grid = [20, 40, 60, 90]
-    z_entry_grid = [1.5, 2.0, 2.5]
-    z_exit_grid = [0.0, 0.5, 1.0]
-
-    z_by_L: dict[int, np.ndarray] = {}
-    for L in L_grid:
-        cols = []
-        for pk in pair_keys:
-            sp = _pair_aligned_series(spread_wide, pk, calendar)
-            cols.append(_rolling_z(sp, L))
-        z_by_L[L] = np.column_stack(cols) if cols else np.zeros((len(calendar), 0))
-
-    for L in L_grid:
-        z_mat = z_by_L[L]
-        for z_e in z_entry_grid:
-            for z_x in z_exit_grid:
-                if z_x >= z_e:
-                    continue
-                n_d, n_p = z_mat.shape
-                E_all = np.zeros((n_d, n_p), dtype=np.float64)
-                for j in range(n_p):
-                    E_all[:, j] = _state_machine_exposures(z_mat[:, j], z_e, z_x)
-                score = _train_sharpe_from_E(calendar, E_all, M_hedge, price_wide, tickers, split_date)
-                if score > best_score:
-                    best_score = score
-                    best = {
-                        "lookback": L,
-                        "z_entry": z_e,
-                        "z_exit": z_x,
-                        "split_date": split_date,
-                        "train_sharpe": score,
-                    }
-
-    if best is None:
-        best = {"lookback": 60, "z_entry": 2.0, "z_exit": 0.5, "split_date": split_date, "train_sharpe": 0.0}
-
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    with open(out_path, "wb") as f:
-        pickle.dump(best, f)
-    return best
-
-
-def load_traditional_params(path: str | None = None) -> dict[str, Any]:
-    path = path or TRADITIONAL_PARAMS_PATH
-    with open(path, "rb") as f:
-        return pickle.load(f)
-
-
 def compute_traditional_weights_by_date(
     dates: list[pd.Timestamp],
     pairs: list[tuple[str, str]],
@@ -335,7 +254,7 @@ def compute_traditional_weights_by_date(
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Fit traditional pairs params (grid search on train)")
+    p = argparse.ArgumentParser(description="Write fixed traditional pairs parameters to pickle")
     p.add_argument(
         "--out",
         type=str,
@@ -347,11 +266,12 @@ def parse_args():
 
 def main():
     args = parse_args()
-    best = fit_traditional_params(out_path=args.out)
-    print("Traditional pairs — grid search (train Sharpe)")
+    params = save_traditional_params(out_path=args.out)
+    print("Traditional pairs — fixed strategy parameters")
     print(f"  Saved: {os.path.abspath(args.out)}")
-    print(f"  Best: lookback={best['lookback']}, z_entry={best['z_entry']}, z_exit={best['z_exit']}")
-    print(f"  Train Sharpe: {best['train_sharpe']:.4f}")
+    print(
+        f"  lookback={params['lookback']}, z_entry={params['z_entry']}, z_exit={params['z_exit']}"
+    )
 
 
 if __name__ == "__main__":

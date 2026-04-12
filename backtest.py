@@ -32,7 +32,7 @@ from benchmark import BENCHMARK_MODEL_DIR, H_BENCHMARK, BenchmarkDDPG
 from traditional import (
     TRADITIONAL_PARAMS_PATH,
     compute_traditional_weights_by_date,
-    load_traditional_params,
+    resolve_traditional_params,
 )
 
 # ---------------------------------------------------------------------------
@@ -451,7 +451,10 @@ def parse_args():
         "--traditional-params",
         type=str,
         default=None,
-        help=f"Traditional pairs params pickle (default: {TRADITIONAL_PARAMS_PATH})",
+        help=(
+            f"Optional pickle overriding lookback / z_entry / z_exit "
+            f"(default: use built-in fixed params, or merge {TRADITIONAL_PARAMS_PATH} if present)"
+        ),
     )
     return p.parse_args()
 
@@ -526,26 +529,22 @@ def main():
     print(f"  MPHDRL dates with weights: {len(mphdrl_weights)}")
     print(f"  Benchmark dates with weights: {len(bench_weights)}")
 
-    trad_params_path = args.traditional_params or TRADITIONAL_PARAMS_PATH
     trad_weights: dict = {}
-    if os.path.isfile(trad_params_path):
-        trad_params = load_traditional_params(trad_params_path)
-        hedge_path = os.path.join("data", "pickle", "hedge_ratios.pkl")
+    hedge_path = os.path.join("data", "pickle", "hedge_ratios.pkl")
+    spread_raw_path = os.path.join("data", "spread", "raw.csv")
+    if os.path.isfile(hedge_path) and os.path.isfile(spread_raw_path):
+        trad_params = resolve_traditional_params(args.traditional_params or TRADITIONAL_PARAMS_PATH)
         with open(hedge_path, "rb") as f:
             hedge_ratios = pickle.load(f)
-        spread_raw_path = os.path.join("data", "spread", "raw.csv")
-        spread_wide = None
-        if os.path.isfile(spread_raw_path):
-            raw_sp = pd.read_csv(spread_raw_path, parse_dates=["Date"])
-            spread_wide = raw_sp.pivot(index="Date", columns="Pair", values="spread").sort_index()
+        raw_sp = pd.read_csv(spread_raw_path, parse_dates=["Date"])
+        spread_wide = raw_sp.pivot(index="Date", columns="Pair", values="spread").sort_index()
         trad_weights = compute_traditional_weights_by_date(
             valid_dates, pairs, hedge_ratios, trad_params, spread_wide=spread_wide,
         )
         print(f"  Traditional pairs dates with weights: {len(trad_weights)}")
     else:
         print(
-            f"\n  SKIP Traditional pairs: missing {trad_params_path}\n"
-            f"    Run:  python traditional.py"
+            f"\n  SKIP Traditional pairs: need {hedge_path} and {spread_raw_path}"
         )
 
     # --- Run backtests ---
