@@ -1,5 +1,5 @@
 """
-backtest.py -- Walk-forward backtesting for MPHDRL, Benchmark RL, and Nifty 50 buy-and-hold.
+backtest.py -- Walk-forward backtesting for MPHDRL, Benchmark RL, Traditional pairs (benchmark3), and Nifty 50 buy-and-hold.
 
 Produces daily gross/net PnL, returns, costs, taxes for each strategy and exports
 CSV files to data/backtest/ for downstream performance comparison.
@@ -29,6 +29,11 @@ from MPHDRL import (
     build_pair_ticker_mapping,
 )
 from benchmark import BENCHMARK_MODEL_DIR, H_BENCHMARK, BenchmarkDDPG
+from traditional import (
+    TRADITIONAL_PARAMS_PATH,
+    compute_traditional_weights_by_date,
+    load_traditional_params,
+)
 
 # ---------------------------------------------------------------------------
 # Parameters
@@ -442,6 +447,12 @@ def parse_args():
         "--benchmark-checkpoint", type=str, default=None, dest="bench_ckpt",
         help="Benchmark .pt checkpoint (default: models/benchmark/final.pt or checkpoint.pt)",
     )
+    p.add_argument(
+        "--traditional-params",
+        type=str,
+        default=None,
+        help=f"Traditional pairs params pickle (default: {TRADITIONAL_PARAMS_PATH})",
+    )
     return p.parse_args()
 
 
@@ -515,17 +526,47 @@ def main():
     print(f"  MPHDRL dates with weights: {len(mphdrl_weights)}")
     print(f"  Benchmark dates with weights: {len(bench_weights)}")
 
+    trad_params_path = args.traditional_params or TRADITIONAL_PARAMS_PATH
+    trad_weights: dict = {}
+    if os.path.isfile(trad_params_path):
+        trad_params = load_traditional_params(trad_params_path)
+        hedge_path = os.path.join("data", "pickle", "hedge_ratios.pkl")
+        with open(hedge_path, "rb") as f:
+            hedge_ratios = pickle.load(f)
+        spread_raw_path = os.path.join("data", "spread", "raw.csv")
+        spread_wide = None
+        if os.path.isfile(spread_raw_path):
+            raw_sp = pd.read_csv(spread_raw_path, parse_dates=["Date"])
+            spread_wide = raw_sp.pivot(index="Date", columns="Pair", values="spread").sort_index()
+        trad_weights = compute_traditional_weights_by_date(
+            valid_dates, pairs, hedge_ratios, trad_params, spread_wide=spread_wide,
+        )
+        print(f"  Traditional (benchmark3) dates with weights: {len(trad_weights)}")
+    else:
+        print(
+            f"\n  SKIP Traditional pairs (benchmark3): missing {trad_params_path}\n"
+            f"    Run:  python traditional.py"
+        )
+
     # --- Run backtests ---
     print("\nRunning walk-forward backtests...")
     df_mphdrl = run_strategy_backtest("MPHDRL", mphdrl_weights, price_wide, tickers, valid_dates)
     df_bench = run_strategy_backtest("Benchmark", bench_weights, price_wide, tickers, valid_dates)
+    df_trad = run_strategy_backtest(
+        "Traditional pairs", trad_weights, price_wide, tickers, valid_dates,
+    )
 
     test_start = pd.Timestamp(valid_dates[0]) if valid_dates else pd.Timestamp("2024-01-01")
     test_end = pd.Timestamp(valid_dates[-1]) if valid_dates else pd.Timestamp("2025-12-31")
     df_nifty = run_nifty_backtest(nifty_df, test_start, test_end)
 
     # --- Export ---
-    for name, df in [("mphdrl", df_mphdrl), ("benchmark", df_bench), ("nifty50", df_nifty)]:
+    for name, df in [
+        ("mphdrl", df_mphdrl),
+        ("benchmark", df_bench),
+        ("benchmark3", df_trad),
+        ("nifty50", df_nifty),
+    ]:
         out_path = os.path.join(BACKTEST_DIR, f"{name}.csv")
         df.to_csv(out_path, index=False)
         print(f"  Saved: {out_path}")
@@ -534,7 +575,12 @@ def main():
     print(f"\n{'=' * 60}")
     print("BACKTEST SUMMARY")
     print(f"{'=' * 60}")
-    for label, df in [("MPHDRL", df_mphdrl), ("Benchmark RL", df_bench), ("Nifty 50 B&H", df_nifty)]:
+    for label, df in [
+        ("MPHDRL", df_mphdrl),
+        ("Benchmark RL", df_bench),
+        ("Traditional pairs (benchmark3)", df_trad),
+        ("Nifty 50 B&H", df_nifty),
+    ]:
         if df.empty:
             print(f"  {label}: no data")
             continue
