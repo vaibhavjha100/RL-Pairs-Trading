@@ -1,9 +1,8 @@
 """
 training.py -- Agent-agnostic training harness for RL pairs trading.
 
-Supports multiple RL agent types via a registry pattern. Currently implements
-the MPHDRL training loop; future agents (benchmarks, ablations) can be added
-by registering a new trainer class.
+Supports multiple RL agent types via a registry pattern: MPHDRL (hybrid HDRL)
+and Benchmark (plain GRU actor–critic, DDPG-style replay on pair exposures E).
 
 Training logic follows multi_pair_hdrl_trader_architecture.md (TD3 critics,
 DDQN stop-loss head, delayed actor + portfolio + auxiliary regression, PER).
@@ -12,6 +11,7 @@ Usage:
     python training.py --agent MPHDRL --epochs 100
     python training.py --agent MPHDRL --epochs 50 --device cuda
     python training.py --agent MPHDRL --epochs 50 --device auto
+    python training.py --agent Benchmark --epochs 100 --device cuda
 
 On CUDA (default): cudnn benchmark, TF32, fast H2D copies, mixed precision (bfloat16
 if supported else float16 + GradScaler), and torch.compile on forward_step unless
@@ -37,6 +37,7 @@ from MPHDRL import (
     PrioritizedReplayBuffer,
     check_data_readiness,
 )
+from benchmark import BENCHMARK_MODEL_DIR, BenchmarkDDPG
 
 
 def resolve_training_device(preference: str) -> torch.device:
@@ -453,6 +454,219 @@ class MPHDRLTrainer(BaseTrainer):
             elapsed = time.time() - t0
             avg = {k: np.mean(v) for k, v in epoch_losses.items()}
             loss_str = "  ".join(f"{k}={v:.4f}" for k, v in avg.items())
+            print(f"Epoch {epoch:4d}/{self.epochs} | {elapsed:5.1f}s | trans={n_trans} | {loss_str}")
+
+            if epoch % self.save_every == 0 or epoch == self.epochs:
+                self.save(tag=f"epoch_{epoch}")
+
+        self.save(tag="final")
+        print(f"\nTraining complete. Final model saved to {self.model_dir}")
+
+    def save(self, tag="checkpoint"):
+        path = os.path.join(self.model_dir, f"{tag}.pt")
+        self.model.save_checkpoint(path)
+
+
+# ============================================================================
+# Uniform replay (for Benchmark agent)
+# ============================================================================
+
+class UniformReplayBuffer:
+    """Ring buffer with uniform random sampling (no prioritization)."""
+
+    def __init__(self, capacity: int):
+        self.capacity = max(1, int(capacity))
+        self.buffer: list = []
+        self.pos = 0
+
+    def add(self, transition: dict) -> None:
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(transition)
+        else:
+            self.buffer[self.pos] = transition
+        self.pos = (self.pos + 1) % self.capacity
+
+    def sample(self, batch_size: int) -> list:
+        n = len(self.buffer)
+        if n == 0:
+            raise ValueError("UniformReplayBuffer is empty.")
+        replace = batch_size > n
+        idx = np.random.choice(n, size=batch_size, replace=replace)
+        return [self.buffer[i] for i in idx]
+
+    def __len__(self) -> int:
+        return len(self.buffer)
+
+
+# ============================================================================
+# Benchmark (DDPG-style) trainer
+# ============================================================================
+
+@register_agent("Benchmark")
+class BenchmarkTrainer(BaseTrainer):
+    """Plain actor–critic: Gaussian E, same env reward as MPHDRL, uniform replay."""
+
+    def __init__(self, args, data):
+        super().__init__(args, data)
+        self.device = args.resolved_device
+        self.epochs = args.epochs
+        self.save_every = args.save_every
+        self.model_dir = BENCHMARK_MODEL_DIR
+        os.makedirs(self.model_dir, exist_ok=True)
+
+        F_dim = data["X_train"].shape[2]
+        n_pairs = len(data["pairs"])
+        n_tickers = len(data["tickers"])
+        self.n_pairs = n_pairs
+
+        self.model = BenchmarkDDPG(
+            F_dim, n_pairs, n_tickers, data["M"], device=str(self.device)
+        )
+
+        self.env = TradingEnvironment(
+            pairs=data["pairs"],
+            tickers=data["tickers"],
+            ticker_to_idx=data["ticker_to_idx"],
+            trading_raw_path=os.path.join("data", "trading", "raw.csv"),
+            sequence_meta=data["sequence_meta"],
+            X_train=data["X_train"],
+            y_train=data["y_train"],
+            zeta=HPARAMS["zeta"],
+            gamma=HPARAMS["gamma"],
+            risk_lambda=HPARAMS["risk_lambda"],
+            var_window=HPARAMS["var_window"],
+        )
+
+        buffer_cap = max(10000, self.env.num_steps * 2)
+        self.replay = UniformReplayBuffer(buffer_cap)
+
+        lr = HPARAMS["lr"]
+        self.opt_actor = torch.optim.Adam(
+            list(self.model.actor_encoder.parameters())
+            + list(self.model.actor_mu.parameters())
+            + [self.model.log_std],
+            lr=lr,
+            betas=(0.9, 0.999),
+            eps=1e-7,
+        )
+        self.opt_critic = torch.optim.Adam(
+            list(self.model.critic_encoder.parameters()) + list(self.model.critic_head.parameters()),
+            lr=lr,
+            betas=(0.9, 0.999),
+            eps=1e-7,
+        )
+
+    def _h2d(self, arr, dtype=torch.float32):
+        dev = self.model.device
+        if dev.type == "cuda":
+            return torch.as_tensor(np.asarray(arr), dtype=dtype).pin_memory().to(
+                dev, non_blocking=True
+            )
+        return torch.tensor(np.asarray(arr), dtype=dtype, device=dev)
+
+    def _collect_episode(self):
+        state_info = self.env.reset()
+        if state_info is None:
+            return 0
+        n = 0
+        while True:
+            windows, _mask, _y = state_info
+            with torch.no_grad():
+                step_out = self.model.forward_step(windows, explore=True)
+
+            w_np = step_out["weights"].detach().cpu().numpy().reshape(-1)
+            E_np = step_out["pair_exposures"].detach().cpu().numpy().reshape(self.n_pairs)
+
+            next_info, reward, done = self.env.step(w_np)
+            if next_info is not None:
+                next_windows, _, _ = next_info
+            else:
+                next_windows = np.zeros_like(windows)
+
+            self.replay.add(
+                {
+                    "state_windows": windows.astype(np.float32),
+                    "E": E_np.astype(np.float32),
+                    "reward": np.float32(reward),
+                    "next_state_windows": next_windows.astype(np.float32),
+                    "done": np.float32(1.0 if done else 0.0),
+                }
+            )
+            n += 1
+            if done:
+                break
+            state_info = next_info
+        return n
+
+    def _update_step(self):
+        B = HPARAMS["batch_size"]
+        gamma = HPARAMS["discount_gamma"]
+        if len(self.replay) < B:
+            return {}
+
+        batch = self.replay.sample(B)
+
+        sw = self._h2d(np.stack([t["state_windows"] for t in batch]))
+        E = self._h2d(np.stack([t["E"] for t in batch]))
+        rews = self._h2d(np.array([t["reward"] for t in batch]))
+        nsw = self._h2d(np.stack([t["next_state_windows"] for t in batch]))
+        dones = self._h2d(np.array([t["done"] for t in batch]))
+
+        with torch.no_grad():
+            mu_next = self.model.actor_mean_target(nsw)
+            q_next = self.model.critic_q(
+                nsw, mu_next, self.model.critic_encoder_t, self.model.critic_head_t
+            )
+            y = rews + (1.0 - dones) * gamma * q_next
+
+        q = self.model.critic_q(sw, E, self.model.critic_encoder, self.model.critic_head)
+        loss_c = F.mse_loss(q, y)
+        self.opt_critic.zero_grad()
+        loss_c.backward()
+        self.opt_critic.step()
+
+        for p in self.model.critic_encoder.parameters():
+            p.requires_grad = False
+        for p in self.model.critic_head.parameters():
+            p.requires_grad = False
+
+        mu = self.model.actor_mean(sw)
+        q_a = self.model.critic_q(sw, mu, self.model.critic_encoder, self.model.critic_head)
+        loss_a = -q_a.mean()
+
+        self.opt_actor.zero_grad()
+        loss_a.backward()
+        self.opt_actor.step()
+
+        for p in self.model.critic_encoder.parameters():
+            p.requires_grad = True
+        for p in self.model.critic_head.parameters():
+            p.requires_grad = True
+
+        self.model.soft_update()
+
+        return {"critic": loss_c.item(), "actor": loss_a.item()}
+
+    def train(self):
+        print(f"\n{'=' * 60}")
+        print(f"Training Benchmark (DDPG-style) agent for {self.epochs} epochs")
+        print(f"Device: {self.device} ({self.device.type}) | Pairs: {self.n_pairs}")
+        print(f"{'=' * 60}\n")
+
+        for epoch in range(1, self.epochs + 1):
+            t0 = time.time()
+            n_trans = self._collect_episode()
+
+            epoch_losses = {}
+            n_updates = min(n_trans, self.env.num_steps)
+            for _ in range(n_updates):
+                step_losses = self._update_step()
+                for k, v in step_losses.items():
+                    epoch_losses.setdefault(k, []).append(v)
+
+            elapsed = time.time() - t0
+            avg = {k: np.mean(v) for k, v in epoch_losses.items()}
+            loss_str = "  ".join(f"{k}={v:.4f}" for k, v in avg.items()) if avg else "(no updates)"
             print(f"Epoch {epoch:4d}/{self.epochs} | {elapsed:5.1f}s | trans={n_trans} | {loss_str}")
 
             if epoch % self.save_every == 0 or epoch == self.epochs:
