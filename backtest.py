@@ -32,6 +32,7 @@ from benchmark import BENCHMARK_MODEL_DIR, H_BENCHMARK, BenchmarkDDPG
 from traditional import (
     TRADITIONAL_PARAMS_PATH,
     compute_traditional_weights_by_date,
+    load_precomputed_spread_wide,
     resolve_traditional_params,
 )
 
@@ -533,11 +534,11 @@ def main():
     hedge_path = os.path.join("data", "pickle", "hedge_ratios.pkl")
     spread_raw_path = os.path.join("data", "spread", "raw.csv")
     if os.path.isfile(hedge_path) and os.path.isfile(spread_raw_path):
+        # Same pairs as RL; hedge_ratios.pkl + spread/raw.csv are pipeline outputs (not recomputed).
         trad_params = resolve_traditional_params(args.traditional_params or TRADITIONAL_PARAMS_PATH)
         with open(hedge_path, "rb") as f:
             hedge_ratios = pickle.load(f)
-        raw_sp = pd.read_csv(spread_raw_path, parse_dates=["Date"])
-        spread_wide = raw_sp.pivot(index="Date", columns="Pair", values="spread").sort_index()
+        spread_wide = load_precomputed_spread_wide(spread_raw_path)
         trad_weights = compute_traditional_weights_by_date(
             valid_dates, pairs, hedge_ratios, trad_params, spread_wide=spread_wide,
         )

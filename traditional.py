@@ -1,11 +1,22 @@
 """
-traditional.py -- Classical mean-reversion pairs trading (beta-hedged); fixed rules for backtest traditional.csv.
+traditional.py -- Classical mean-reversion pairs trading; fixed rules for backtest traditional.csv.
 
-Uses close spread from data/spread/raw.csv and hedge ratios from data/pickle/hedge_ratios.pkl.
-Hyperparameters are fixed constants (no grid search / training optimization).
+Data contract (read-only — nothing is re-estimated here):
 
-Optional: python traditional.py [--out path] writes the same fixed dict to a pickle for inspection
-or for resolve_traditional_params() to merge overrides from file.
+- **Pairs**: the caller passes the same ordered list as MPHDRL / benchmark RL
+  (typically `cointegrated_pairs.pkl` via `backtest.load_test_bundle`). This module
+  does not search for or change pairs.
+
+- **Hedge ratios**: the caller passes the dict loaded from
+  `data/pickle/hedge_ratios.pkl` (written by `spread.py`). Betas are never
+  recomputed inside this module.
+
+- **Spreads**: use the precomputed close spread series from the pipeline, i.e.
+  `data/spread/raw.csv` (columns `Date`, `Pair`, `spread` — output of `spread.py`).
+  Spreads are never rebuilt from prices here.
+
+Hyperparameters (`lookback`, `z_entry`, `z_exit`) are fixed constants, optionally
+merged from a small pickle via `resolve_traditional_params`.
 
 Usage:
     python traditional.py
@@ -25,6 +36,19 @@ PICKLE_DIR = os.path.join("data", "pickle")
 SPREAD_DIR = os.path.join("data", "spread")
 TRADITIONAL_PARAMS_PATH = os.path.join(PICKLE_DIR, "traditional_params.pkl")
 SPREAD_RAW_PATH = os.path.join(SPREAD_DIR, "raw.csv")
+
+
+def load_precomputed_spread_wide(path: str | None = None) -> pd.DataFrame:
+    """
+    Load precomputed log-spreads from disk (wide: index Date, columns Pair).
+
+    Expects pipeline output (e.g. `spread.py` -> `data/spread/raw.csv`); does not
+    recompute spreads from equity prices.
+    """
+    path = path or SPREAD_RAW_PATH
+    raw_sp = pd.read_csv(path, parse_dates=["Date"])
+    return raw_sp.pivot(index="Date", columns="Pair", values="spread").sort_index()
+
 
 # Fixed mean-reversion bands (rolling z on spread; hysteresis z_exit < z_entry).
 DEFAULT_LOOKBACK = 60
@@ -104,7 +128,11 @@ def build_M_hedge(
     hedge_ratios: dict[tuple[str, str], float],
     ticker_to_idx: dict[str, int],
 ) -> np.ndarray:
-    """Row p: +1 on leg A, -beta on leg B for spread log(A) - beta*log(B)."""
+    """
+    Row p: +1 on leg A, -beta on leg B (same beta as in precomputed spread log(A)-beta*log(B)).
+
+    `hedge_ratios` must be the loaded `hedge_ratios.pkl` map; betas are not estimated here.
+    """
     n_pairs = len(pairs)
     n_t = len(ticker_to_idx)
     M = np.zeros((n_pairs, n_t), dtype=np.float64)
@@ -220,15 +248,16 @@ def compute_traditional_weights_by_date(
     Causal warmup: build exposure path over full spread calendar up to max(dates),
     then return weights for each d in dates (must exist in spread_wide index).
 
-    dates: sorted unique trading dates (e.g. test_dates from meta).
+    ``pairs`` / ``hedge_ratios`` / spread columns must match the RL pipeline (same universe,
+    same `Pair` keys as `A|B` in spread files). If ``spread_wide`` is None, loads
+    ``load_precomputed_spread_wide()`` (pipeline raw spreads only).
     """
     _, tickers, ticker_to_idx = build_pair_ticker_mapping(pairs)
     M_hedge = build_M_hedge(pairs, hedge_ratios, ticker_to_idx)
     pair_keys = [f"{a}|{b}" for a, b in pairs]
 
     if spread_wide is None:
-        raw_sp = pd.read_csv(SPREAD_RAW_PATH, parse_dates=["Date"])
-        spread_wide = raw_sp.pivot(index="Date", columns="Pair", values="spread").sort_index()
+        spread_wide = load_precomputed_spread_wide()
 
     L = int(params["lookback"])
     z_e = float(params["z_entry"])
