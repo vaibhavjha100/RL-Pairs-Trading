@@ -1,5 +1,5 @@
 """
-backtest.py -- Walk-forward backtesting for MPHDRL, Benchmark RL, Traditional pairs (benchmark3), and Nifty 50 buy-and-hold.
+backtest.py -- Walk-forward backtesting for MPHDRL, Benchmark RL, Traditional pairs, and Nifty 50 buy-and-hold.
 
 Produces daily gross/net PnL, returns, costs, taxes for each strategy and exports
 CSV files to data/backtest/ for downstream performance comparison.
@@ -541,10 +541,10 @@ def main():
         trad_weights = compute_traditional_weights_by_date(
             valid_dates, pairs, hedge_ratios, trad_params, spread_wide=spread_wide,
         )
-        print(f"  Traditional (benchmark3) dates with weights: {len(trad_weights)}")
+        print(f"  Traditional pairs dates with weights: {len(trad_weights)}")
     else:
         print(
-            f"\n  SKIP Traditional pairs (benchmark3): missing {trad_params_path}\n"
+            f"\n  SKIP Traditional pairs: missing {trad_params_path}\n"
             f"    Run:  python traditional.py"
         )
 
@@ -564,7 +564,7 @@ def main():
     for name, df in [
         ("mphdrl", df_mphdrl),
         ("benchmark", df_bench),
-        ("benchmark3", df_trad),
+        ("traditional", df_trad),
         ("nifty50", df_nifty),
     ]:
         out_path = os.path.join(BACKTEST_DIR, f"{name}.csv")
@@ -578,7 +578,7 @@ def main():
     for label, df in [
         ("MPHDRL", df_mphdrl),
         ("Benchmark RL", df_bench),
-        ("Traditional pairs (benchmark3)", df_trad),
+        ("Traditional pairs", df_trad),
         ("Nifty 50 B&H", df_nifty),
     ]:
         if df.empty:

@@ -1,5 +1,5 @@
 """
-traditional.py -- Classical mean-reversion pairs trading (beta-hedged) for benchmark3.
+traditional.py -- Classical mean-reversion pairs trading (beta-hedged); params for backtest traditional.csv.
 
 Uses close spread from data/spread/raw.csv and hedge ratios from data/pickle/hedge_ratios.pkl.
 Fits entry/exit/lookback on the pre-split training period (same cut as backtest.load_test_bundle),
