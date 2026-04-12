@@ -282,14 +282,19 @@ def run_strategy_backtest(strategy_name, weights_by_date, price_wide, tickers, t
         realized_gross = _compute_realized_pnl(prev_w, w, r, net_pv)
         net_realized_pnl = realized_gross - txn_cost - shorting_cost
 
+        # tax_carryforward = non-negative pool of STCG already paid on realized gains
+        # that loss-days can rebate against (never rebate without prior payments).
         if net_realized_pnl > 0:
-            tax_flow = -(net_realized_pnl * STCG_RATE)
+            payment = net_realized_pnl * STCG_RATE
+            tax_flow = -payment
+            tax_carryforward += payment
         elif net_realized_pnl < 0:
-            tax_flow = abs(net_realized_pnl) * STCG_RATE
+            raw_rebate = abs(net_realized_pnl) * STCG_RATE
+            rebate = min(raw_rebate, tax_carryforward)
+            tax_flow = rebate
+            tax_carryforward -= rebate
         else:
             tax_flow = 0.0
-
-        tax_carryforward += tax_flow
 
         if prev_date is not None and _crosses_fiscal_year(prev_date, d_t):
             if tax_carryforward > 0:
