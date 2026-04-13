@@ -15,6 +15,7 @@ Requires scipy (Wilcoxon test): pip install scipy
 Usage:
     python comparison.py
     python comparison.py --backtest-dir data/backtest --results-dir data/backtest/results
+    python comparison.py --alpha 0.05
 """
 
 from __future__ import annotations
@@ -46,6 +47,7 @@ except ImportError:
 RESULTS_SUBDIR = "results"
 UTILITY_GAMMA = 0.5
 DEFAULT_UTILITY_WINDOW = 60
+DEFAULT_SIGNIFICANCE_ALPHA = 0.05
 
 STRATEGY_FILES = (
     ("MPHDRL", "mphdrl.csv"),
@@ -230,6 +232,9 @@ def run_wilcoxon_mphdrl_greater(
     pval = res.pvalue
     return {
         "benchmark": label_bench,
+        "test": "Wilcoxon signed-rank",
+        "pairing": "paired_calendar_dates",
+        "difference": "U_MPHDRL(t) - U_benchmark(t)",
         "n_pairs": int(d.size),
         "alternative": "greater",
         "zero_method": "wilcox",
@@ -238,11 +243,28 @@ def run_wilcoxon_mphdrl_greater(
     }
 
 
+def _wilcoxon_conclusion(pvalue: float | None, alpha: float) -> tuple[bool | None, str]:
+    """(reject_h0, one-line conclusion). reject_h0 True => evidence MPHDRL median utility > benchmark."""
+    if pvalue is None or not np.isfinite(pvalue):
+        return None, "p-value unavailable; no decision."
+    reject = pvalue < alpha
+    if reject:
+        return (
+            True,
+            f"Reject H0 at alpha={alpha:g} (p < {alpha:g}); evidence that median paired difference > 0.",
+        )
+    return (
+        False,
+        f"Fail to reject H0 at alpha={alpha:g} (p >= {alpha:g}); insufficient evidence that median difference > 0.",
+    )
+
+
 def build_report(
     summaries: list[dict[str, Any]],
     wilcox_rows: list[dict[str, Any]],
     window: int,
     gamma: float,
+    alpha: float = DEFAULT_SIGNIFICANCE_ALPHA,
 ) -> str:
     lines: list[str] = []
     lines.append("=" * 88)
@@ -286,18 +308,37 @@ def build_report(
             f"{s['total_costs_pct_initial_cash']:>7.3f}% {s['costs_bps_per_year_of_mean_gross_pv']:>10.1f}"
         )
     lines.append("")
-    lines.append("--- Wilcoxon signed-rank (paired, one-tailed) ---")
+    lines.append("--- Hypothesis tests: median daily rolling utility (MPHDRL vs benchmark) ---")
     lines.append(utility_definition_text(window, gamma))
-    lines.append("H0: median(U_MPHDRL - U_benchmark) <= 0  vs  H1: median > 0.")
+    lines.append("")
+    lines.append("Specification (same for each benchmark below):")
+    lines.append("  Procedure : scipy.stats.wilcoxon (paired Wilcoxon signed-rank)")
+    lines.append("  Pairing   : one observation per common calendar date t (inner join on date)")
+    lines.append(
+        "  Difference: d_t = U_MPHDRL(t) - U_benchmark(t), net rolling utility as defined above"
+    )
+    lines.append("  Alternative: 'greater' (one-tailed test on d_t)")
+    lines.append("  Zeros     : zero_method='wilcox' (zeros excluded from ranking per Wilcoxon)")
+    lines.append(f"  Significance level: alpha = {alpha:g} (reject H0 if p-value < alpha)")
+    lines.append("")
+    lines.append("Hypotheses (each benchmark block):")
+    lines.append("  H0: median(d_t) <= 0   (MPHDRL not greater than benchmark on median daily utility)")
+    lines.append("  H1: median(d_t) > 0    (MPHDRL greater than benchmark on median daily utility)")
     lines.append("")
     for w in wilcox_rows:
-        lines.append(f"  vs {w.get('benchmark', '?')}:")
+        bench = w.get("benchmark", "?")
+        lines.append(f"  [{bench}]")
         if "error" in w:
-            lines.append(f"    {w['error']} (n={w.get('n_pairs', 0)})")
+            lines.append(f"    Status   : not run — {w['error']}")
+            lines.append(f"    n (pairs): {w.get('n_pairs', 0)}")
         else:
-            lines.append(
-                f"    n={w['n_pairs']}, statistic={w.get('statistic')}, p-value={w.get('pvalue')}"
-            )
+            pv = w.get("pvalue")
+            st = w.get("statistic")
+            reject, verdict = _wilcoxon_conclusion(pv, alpha)
+            lines.append(f"    n (paired days)     : {w['n_pairs']}")
+            lines.append(f"    Wilcoxon statistic  : {st}")
+            lines.append(f"    p-value (one-tailed): {pv}")
+            lines.append(f"    Decision (alpha={alpha:g}) : {verdict}")
     lines.append("")
     lines.append("=" * 88)
     return "\n".join(lines) + "\n"
@@ -314,12 +355,22 @@ def main() -> None:
     )
     p.add_argument("--utility-window", type=int, default=DEFAULT_UTILITY_WINDOW, help="Trailing days for U_t")
     p.add_argument("--gamma", type=float, default=UTILITY_GAMMA, help="Risk aversion in U_t")
+    p.add_argument(
+        "--alpha",
+        type=float,
+        default=DEFAULT_SIGNIFICANCE_ALPHA,
+        help="Significance level for Wilcoxon H0 rejection (default: 0.05)",
+    )
     args = p.parse_args()
 
     base = args.backtest_dir
     results_dir = args.results_dir or os.path.join(base, RESULTS_SUBDIR)
     window = int(args.utility_window)
     gamma = float(args.gamma)
+    alpha = float(args.alpha)
+    if not (0.0 < alpha < 1.0):
+        print("--alpha must be in (0, 1)", file=sys.stderr)
+        sys.exit(1)
 
     loaded: dict[str, pd.DataFrame] = {}
     summaries: list[dict[str, Any]] = []
@@ -365,15 +416,40 @@ def main() -> None:
         run_wilcoxon_mphdrl_greater(ser_mph, ser_trad, "Traditional pairs"),
     ]
 
+    tests_for_json: list[dict[str, Any]] = []
+    for w in wilcox_rows:
+        row: dict[str, Any] = dict(w)
+        row["significance_alpha"] = alpha
+        if "error" not in w and w.get("pvalue") is not None:
+            rej, verdict = _wilcoxon_conclusion(float(w["pvalue"]), alpha)
+            row["reject_h0"] = rej
+            row["conclusion"] = verdict
+        else:
+            row["reject_h0"] = None
+            row["conclusion"] = row.get("error", "not run")
+        tests_for_json.append(row)
+
     util_def = utility_definition_text(window, gamma)
     wilcox_json = {
         "utility_definition": util_def,
         "gamma": gamma,
         "window": window,
-        "tests": wilcox_rows,
+        "significance_alpha": alpha,
+        "hypotheses": {
+            "H0": "median(U_MPHDRL - U_benchmark) <= 0",
+            "H1": "median(U_MPHDRL - U_benchmark) > 0",
+        },
+        "test_specification": {
+            "procedure": "scipy.stats.wilcoxon",
+            "paired_on": "date",
+            "difference": "U_MPHDRL(t) - U_benchmark(t)",
+            "alternative": "greater",
+            "zero_method": "wilcox",
+        },
+        "tests": tests_for_json,
     }
 
-    report = build_report(summaries, wilcox_rows, window, gamma)
+    report = build_report(summaries, wilcox_rows, window, gamma, alpha=alpha)
     print(report, end="")
 
     os.makedirs(results_dir, exist_ok=True)
