@@ -55,9 +55,10 @@ STRATEGY_FILES = (
 
 
 def utility_definition_text(window: int, gamma: float) -> str:
+    # Avoid f-string `{...}` in subscript notation (would parse as format fields).
     return (
         f"Daily net utility U_t on trailing {window} trading days (inclusive of t): "
-        f"R_ann(t)=mean(r_{t-window+1:t})*252, Var_ann(t)=var(r,ddof=1)*252 on same window, "
+        f"R_ann(t)=mean(r[t-{window}+1:t])*252, Var_ann(t)=var(r,ddof=1)*252 on same window, "
         f"U_t=R_ann(t)-0.5*{gamma}*Var_ann(t), with r_t=net_portfolio_return."
     )
 
@@ -225,13 +226,15 @@ def run_wilcoxon_mphdrl_greater(
             "n_pairs": int(d.size),
             "error": str(e),
         }
+    stat = res.statistic
+    pval = res.pvalue
     return {
         "benchmark": label_bench,
         "n_pairs": int(d.size),
         "alternative": "greater",
         "zero_method": "wilcox",
-        "statistic": float(res.statistic) if res.statistic is not None else None,
-        "pvalue": float(res.pvalue) if res.pvalue is not None else None,
+        "statistic": float(stat) if stat is not None and np.isfinite(stat) else None,
+        "pvalue": float(pval) if pval is not None and np.isfinite(pval) else None,
     }
 
 
