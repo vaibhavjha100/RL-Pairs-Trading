@@ -352,7 +352,12 @@ class TradingEnvironment:
                  sequence_meta, X_train, y_train, zeta=0.003, gamma=0.5,
                  risk_lambda=1.0, var_window=60,
                  terminal_utility_weight=1.0,
-                 spread_pivot=None):
+                 spread_pivot=None,
+                 split="train",
+                 txn_cost_rate=0.0000307,
+                 short_cost_annual=0.0657,
+                 stcg_rate=0.20,
+                 fiscal_year_end=(3, 31)):
         self.pairs = pairs
         self.tickers = tickers
         self.ticker_to_idx = ticker_to_idx
@@ -363,6 +368,10 @@ class TradingEnvironment:
         self.risk_lambda = risk_lambda
         self.var_window = var_window
         self.terminal_utility_weight = terminal_utility_weight
+        self.txn_cost_rate = float(txn_cost_rate)
+        self.short_cost_daily = float(short_cost_annual) / 252.0
+        self.stcg_rate = float(stcg_rate)
+        self.fiscal_year_end = fiscal_year_end
 
         raw_df = pd.read_csv(trading_raw_path, parse_dates=["Date"])
         price_wide = raw_df.pivot(index="Date", columns="Ticker", values="Close").sort_index()
@@ -373,7 +382,7 @@ class TradingEnvironment:
         if "Unnamed: 0" in meta.columns:
             meta = meta.drop(columns=["Unnamed: 0"])
         meta["target_date"] = pd.to_datetime(meta["target_date"])
-        self.train_meta = meta[meta["split"] == "train"].reset_index(drop=True)
+        self.train_meta = meta[meta["split"] == split].reset_index(drop=True)
 
         self.date_to_sample_indices = {}
         for idx, row in self.train_meta.iterrows():
@@ -401,6 +410,8 @@ class TradingEnvironment:
         self.return_history: list[float] = []
         self.t = 0
         self.prev_w = np.zeros(self.n_tickers, dtype=np.float64)
+        self.tax_carryforward = 0.0
+        self.prev_date = None
         self.spread_at_entry = np.zeros(self.n_pairs, dtype=np.float64)
         self.pair_active = np.zeros(self.n_pairs, dtype=bool)
 
@@ -408,9 +419,35 @@ class TradingEnvironment:
         self.t = 0
         self.return_history = []
         self.prev_w = np.zeros(self.n_tickers, dtype=np.float64)
+        self.tax_carryforward = 0.0
+        self.prev_date = None
         self.spread_at_entry = np.zeros(self.n_pairs, dtype=np.float64)
         self.pair_active = np.zeros(self.n_pairs, dtype=bool)
         return self._get_state_windows()
+
+    def _crosses_fiscal_year(self, d_prev, d_curr):
+        fy_mm, fy_dd = self.fiscal_year_end
+
+        def fy_of(dt):
+            if (dt.month, dt.day) > (fy_mm, fy_dd):
+                return dt.year + 1
+            return dt.year
+
+        return fy_of(d_prev) != fy_of(d_curr)
+
+    @staticmethod
+    def _compute_realized_ret(w_prev, w_new, r):
+        closed = np.zeros_like(w_prev)
+        for i in range(len(w_prev)):
+            wp, wn = w_prev[i], w_new[i]
+            if wp == 0.0:
+                continue
+            same_sign = (np.sign(wp) == np.sign(wn))
+            if same_sign and abs(wn) < abs(wp):
+                closed[i] = abs(wp) - abs(wn)
+            elif not same_sign:
+                closed[i] = abs(wp)
+        return float(np.nansum(closed * r * np.sign(w_prev)))
 
     def _get_state_windows(self):
         if self.t >= len(self.unique_dates):
@@ -511,9 +548,51 @@ class TradingEnvironment:
         safe_p = np.where(np.abs(p_t) < 1e-12, 1.0, p_t)
         raw_returns = (p_t1 - p_t) / safe_p
 
-        sell_mask = (np.sign(w) != np.sign(self.prev_w)) | (np.abs(w) < np.abs(self.prev_w))
-        cost = np.where(sell_mask, np.abs(w) * self.zeta, 0.0)
-        net_return = float(np.nansum(w * raw_returns - cost))
+        w_long = np.maximum(w, 0.0)
+        w_short = np.minimum(w, 0.0)
+        prev_w_long = np.maximum(self.prev_w, 0.0)
+        prev_w_short = np.minimum(self.prev_w, 0.0)
+
+        gross_long_ret = float(np.nansum(w_long * raw_returns))
+        gross_short_ret = float(np.nansum(w_short * raw_returns))
+
+        turnover_long = float(np.nansum(np.abs(w_long - prev_w_long)))
+        turnover_short = float(np.nansum(np.abs(w_short - prev_w_short)))
+        total_turnover = turnover_long + turnover_short
+
+        txn_cost_ret = total_turnover * self.txn_cost_rate
+        if total_turnover > 0:
+            txn_cost_long_ret = txn_cost_ret * (turnover_long / total_turnover)
+            txn_cost_short_ret = txn_cost_ret * (turnover_short / total_turnover)
+        else:
+            txn_cost_long_ret = 0.0
+            txn_cost_short_ret = 0.0
+
+        gross_short_exposure = float(np.nansum(np.abs(w_short)))
+        shorting_cost_ret = gross_short_exposure * self.short_cost_daily
+
+        realized_gross_ret = self._compute_realized_ret(self.prev_w, w, raw_returns)
+        net_realized_ret = realized_gross_ret - txn_cost_ret - shorting_cost_ret
+
+        if net_realized_ret > 0:
+            payment = net_realized_ret * self.stcg_rate
+            tax_flow_ret = -payment
+            self.tax_carryforward += payment
+        elif net_realized_ret < 0:
+            raw_rebate = abs(net_realized_ret) * self.stcg_rate
+            rebate = min(raw_rebate, self.tax_carryforward)
+            tax_flow_ret = rebate
+            self.tax_carryforward -= rebate
+        else:
+            tax_flow_ret = 0.0
+
+        if self.prev_date is not None and self._crosses_fiscal_year(self.prev_date, date_t):
+            self.tax_carryforward = 0.0
+
+        tax_per_leg_ret = tax_flow_ret / 2.0
+        net_long_ret = gross_long_ret - txn_cost_long_ret - tax_per_leg_ret
+        net_short_ret = gross_short_ret - txn_cost_short_ret - shorting_cost_ret - tax_per_leg_ret
+        net_return = net_long_ret + net_short_ret
 
         self.return_history.append(net_return)
         if len(self.return_history) >= self.var_window:
@@ -526,6 +605,7 @@ class TradingEnvironment:
         reward = net_return - self.gamma * self.risk_lambda * var_r
 
         self.prev_w = w.copy()
+        self.prev_date = date_t
         self.t += 1
         next_state = self._get_state_windows()
         done = next_state is None

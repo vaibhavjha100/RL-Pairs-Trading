@@ -638,11 +638,23 @@ class BenchmarkTrainer(BaseTrainer):
             betas=(0.9, 0.999),
             eps=1e-7,
         )
+        self.max_grad_norm = float(getattr(args, "max_grad_norm", 1.0))
+        self.nan_batches = 0
+        self.skipped_updates = 0
 
     def _autocast(self):
         if self.use_amp:
             return torch.amp.autocast("cuda", dtype=self._amp_dtype)
         return contextlib.nullcontext()
+
+    @staticmethod
+    def _all_finite(*tensors) -> bool:
+        for t in tensors:
+            if t is None:
+                continue
+            if isinstance(t, torch.Tensor) and not torch.isfinite(t).all():
+                return False
+        return True
 
     def _h2d(self, arr, dtype=torch.float32):
         dev = self.model.device
@@ -736,6 +748,16 @@ class BenchmarkTrainer(BaseTrainer):
         nsw = self._h2d(np.stack([t["next_state_windows"] for t in batch]))
         dones = self._h2d(np.array([t["done"] for t in batch]))
         ns = self._h2d(np.array([t.get("n_step", 1) for t in batch]))
+        E = torch.nan_to_num(E, nan=0.0, posinf=0.0, neginf=0.0)
+        rews = torch.nan_to_num(rews, nan=0.0, posinf=0.0, neginf=0.0)
+        dones = torch.nan_to_num(dones, nan=1.0, posinf=1.0, neginf=1.0).clamp(0.0, 1.0)
+        ns = torch.nan_to_num(ns, nan=1.0, posinf=1.0, neginf=1.0).clamp_min(1.0)
+
+        if not self._all_finite(sw, E, rews, nsw, dones, ns):
+            self.nan_batches += 1
+            self.skipped_updates += 1
+            self.model.soft_update(tau=1.0)
+            return {"skipped_nan": 1.0}
 
         with torch.no_grad():
             with self._autocast():
@@ -745,16 +767,40 @@ class BenchmarkTrainer(BaseTrainer):
                 )
                 gamma_n = gamma ** ns
                 y = rews + (1.0 - dones) * gamma_n * q_next
+                y = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+                q_next = torch.nan_to_num(q_next, nan=0.0, posinf=0.0, neginf=0.0)
+
+        if not self._all_finite(y):
+            self.nan_batches += 1
+            self.skipped_updates += 1
+            self.model.soft_update(tau=1.0)
+            return {"skipped_nan": 1.0}
 
         with self._autocast():
             q = self.model.critic_q(sw, E, self.model.critic_encoder, self.model.critic_head)
             loss_c = F.mse_loss(q, y)
+            q = torch.nan_to_num(q, nan=0.0, posinf=0.0, neginf=0.0)
+            loss_c = torch.nan_to_num(loss_c, nan=0.0, posinf=0.0, neginf=0.0)
+        if not self._all_finite(loss_c):
+            self.nan_batches += 1
+            self.skipped_updates += 1
+            self.model.soft_update(tau=1.0)
+            return {"skipped_nan": 1.0}
         self.opt_critic.zero_grad()
         if self._scaler is not None:
             self._scaler.scale(loss_c).backward()
+            self._scaler.unscale_(self.opt_critic)
+            torch.nn.utils.clip_grad_norm_(
+                list(self.model.critic_encoder.parameters()) + list(self.model.critic_head.parameters()),
+                self.max_grad_norm,
+            )
             self._scaler.step(self.opt_critic)
         else:
             loss_c.backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(self.model.critic_encoder.parameters()) + list(self.model.critic_head.parameters()),
+                self.max_grad_norm,
+            )
             self.opt_critic.step()
 
         for p in self.model.critic_encoder.parameters():
@@ -766,14 +812,40 @@ class BenchmarkTrainer(BaseTrainer):
             mu = self.model.actor_mean(sw)
             q_a = self.model.critic_q(sw, mu, self.model.critic_encoder, self.model.critic_head)
             loss_a = -q_a.mean()
+            q_a = torch.nan_to_num(q_a, nan=0.0, posinf=0.0, neginf=0.0)
+            loss_a = torch.nan_to_num(loss_a, nan=0.0, posinf=0.0, neginf=0.0)
+        if not self._all_finite(loss_a):
+            self.nan_batches += 1
+            self.skipped_updates += 1
+            for p in self.model.critic_encoder.parameters():
+                p.requires_grad = True
+            for p in self.model.critic_head.parameters():
+                p.requires_grad = True
+            self.model.soft_update(tau=1.0)
+            return {"skipped_nan": 1.0}
 
         self.opt_actor.zero_grad()
         if self._scaler is not None:
             self._scaler.scale(loss_a).backward()
+            self._scaler.unscale_(self.opt_actor)
+            torch.nn.utils.clip_grad_norm_(
+                list(self.model.actor_encoder.parameters())
+                + list(self.model.actor_mu.parameters())
+                + [self.model.log_std],
+                self.max_grad_norm,
+            )
             self._scaler.step(self.opt_actor)
         else:
             loss_a.backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(self.model.actor_encoder.parameters())
+                + list(self.model.actor_mu.parameters())
+                + [self.model.log_std],
+                self.max_grad_norm,
+            )
             self.opt_actor.step()
+        with torch.no_grad():
+            self.model.log_std.data.clamp_(-5.0, 2.0)
 
         for p in self.model.critic_encoder.parameters():
             p.requires_grad = True
@@ -803,16 +875,24 @@ class BenchmarkTrainer(BaseTrainer):
             n_trans = self._collect_episode()
 
             epoch_losses = {}
+            epoch_nan = 0
+            epoch_skips = 0
             n_updates = min(n_trans, self.env.num_steps)
             for _ in range(n_updates):
                 step_losses = self._update_step()
                 for k, v in step_losses.items():
                     epoch_losses.setdefault(k, []).append(v)
+                if "skipped_nan" in step_losses:
+                    epoch_nan += 1
+                    epoch_skips += 1
 
             elapsed = time.time() - t0
             avg = {k: np.mean(v) for k, v in epoch_losses.items()}
             loss_str = "  ".join(f"{k}={v:.4f}" for k, v in avg.items()) if avg else "(no updates)"
-            print(f"Epoch {epoch:4d}/{self.epochs} | {elapsed:5.1f}s | trans={n_trans} | {loss_str}")
+            print(
+                f"Epoch {epoch:4d}/{self.epochs} | {elapsed:5.1f}s | trans={n_trans} | "
+                f"{loss_str} | nan_batches={epoch_nan} skipped={epoch_skips}"
+            )
 
             if epoch % self.save_every == 0 or epoch == self.epochs:
                 self.save(tag=f"epoch_{epoch}")

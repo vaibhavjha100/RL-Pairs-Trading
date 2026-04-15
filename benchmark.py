@@ -35,8 +35,20 @@ def pair_exposures_to_weights(E: torch.Tensor, M: torch.Tensor) -> torch.Tensor:
     if E.dim() == 1:
         E = E.unsqueeze(0)
     u = torch.matmul(E, M)
-    w = u / torch.clamp(u.abs().sum(dim=-1, keepdim=True), min=1e-8)
+    u = torch.nan_to_num(u, nan=0.0, posinf=0.0, neginf=0.0)
+
+    l1 = u.abs().sum(dim=-1, keepdim=True)
+    fallback = M[0].unsqueeze(0).expand_as(u)
+    fallback = fallback - fallback.mean(dim=-1, keepdim=True)
+    fallback_l1 = torch.clamp(fallback.abs().sum(dim=-1, keepdim=True), min=1e-8)
+    fallback = fallback / fallback_l1
+
+    w = torch.where(l1 > 1e-8, u / torch.clamp(l1, min=1e-8), fallback)
     w = w - w.mean(dim=-1, keepdim=True)
+    w = torch.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
+
+    w_l1 = w.abs().sum(dim=-1, keepdim=True)
+    w = torch.where(w_l1 > 1e-8, w / torch.clamp(w_l1, min=1e-8), fallback)
     return w
 
 
@@ -190,7 +202,10 @@ class BenchmarkDDPG(nn.Module):
 
         mu = self.actor_mean(w_t)
         E = self.sample_E(mu, explore)
+        mu = torch.nan_to_num(mu, nan=0.0, posinf=0.0, neginf=0.0)
+        E = torch.nan_to_num(E, nan=0.0, posinf=0.0, neginf=0.0)
         w = pair_exposures_to_weights(E, self.M)
+        w = torch.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
 
         probs = torch.full((B, P, 3), 1.0 / 3.0, device=self._device, dtype=w.dtype)
         return {

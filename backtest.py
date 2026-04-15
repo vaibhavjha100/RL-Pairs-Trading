@@ -26,6 +26,7 @@ from MPHDRL import (
     HPARAMS,
     MPHDRL_MODEL_DIR,
     MPHDRLTrader,
+    TradingEnvironment,
     build_pair_ticker_mapping,
 )
 from benchmark import BENCHMARK_MODEL_DIR, H_BENCHMARK, BenchmarkDDPG
@@ -166,6 +167,63 @@ def get_all_test_weights(model, meta_test, x_test, pairs, pair_key_to_idx, n_pai
             out = model.forward_step(windows, explore=False)
         w = out["weights"].detach().cpu().numpy().reshape(-1)
         weights_by_date[d] = w
+    return weights_by_date
+
+
+def get_mphdrl_test_weights_via_env(
+    model,
+    meta_test,
+    x_test,
+    y_test,
+    pairs,
+    tickers,
+    ticker_to_idx,
+    spread_wide=None,
+):
+    """
+    Roll MPHDRL through TradingEnvironment on test split and apply stop-outs
+    via env.step() dynamics. Returns {date: stop-loss-adjusted weight vector}.
+    """
+    env = TradingEnvironment(
+        pairs=pairs,
+        tickers=tickers,
+        ticker_to_idx=ticker_to_idx,
+        trading_raw_path=os.path.join("data", "trading", "raw.csv"),
+        sequence_meta=meta_test,
+        X_train=x_test,
+        y_train=y_test,
+        zeta=HPARAMS["zeta"],
+        gamma=HPARAMS["gamma"],
+        risk_lambda=HPARAMS["risk_lambda"],
+        var_window=HPARAMS["var_window"],
+        terminal_utility_weight=HPARAMS["terminal_utility_weight"],
+        spread_pivot=spread_wide,
+        split="test",
+        txn_cost_rate=TXN_COST_RATE,
+        short_cost_annual=SHORT_COST_ANNUAL,
+        stcg_rate=STCG_RATE,
+        fiscal_year_end=FISCAL_YEAR_END,
+    )
+
+    weights_by_date = {}
+    state = env.reset()
+    model.eval()
+    while state is not None and env.t < len(env.unique_dates):
+        d_t = env.unique_dates[env.t]
+        windows, mask, y_spread = state
+        with torch.no_grad():
+            out = model.forward_step(windows, explore=False)
+
+        raw_w = out["weights"].detach().cpu().numpy().reshape(-1)
+        sl_actions = out["sl_actions"].detach().cpu().numpy().reshape(-1)
+        spread_values = np.where(mask, y_spread, np.nan).astype(np.float64)
+        w_adj = env._apply_stop_outs(raw_w, sl_actions=sl_actions, spread_values=spread_values)
+        weights_by_date[d_t] = w_adj.astype(np.float64)
+
+        state, _, done = env.step(raw_w, sl_actions=sl_actions, spread_values=spread_values)
+        if done:
+            break
+
     return weights_by_date
 
 # ---------------------------------------------------------------------------
@@ -333,6 +391,20 @@ def run_strategy_backtest(strategy_name, weights_by_date, price_wide, tickers, t
     print(f"  {strategy_name}: {len(df)} trading days simulated")
     return df
 
+
+def print_zero_weight_diagnostics(label, weights_by_date):
+    n_days = len(weights_by_date)
+    if n_days == 0:
+        print(f"  {label} zero-weight days: n/a (no weights)")
+        return
+    n_zero = 0
+    for w in weights_by_date.values():
+        wv = np.asarray(w, dtype=np.float64)
+        if not np.isfinite(wv).all() or np.nansum(np.abs(wv)) < 1e-10:
+            n_zero += 1
+    pct = 100.0 * n_zero / max(n_days, 1)
+    print(f"  {label} zero-weight days: {n_zero}/{n_days} ({pct:.2f}%)")
+
 # ---------------------------------------------------------------------------
 # CLI + main
 # ---------------------------------------------------------------------------
@@ -421,26 +493,36 @@ def main():
     print(f"STCG: {STCG_RATE*100:.0f}%  |  LTCG: {LTCG_RATE*100:.1f}%")
     print()
 
+    spread_raw_path = os.path.join("data", "spread", "raw.csv")
+    spread_wide = load_precomputed_spread_wide(spread_raw_path) if os.path.isfile(spread_raw_path) else None
+
     # --- Extract weights for all test dates ---
     print("Extracting model weights for all test dates...")
-    mphdrl_weights = get_all_test_weights(
-        mphdrl_model, meta_test, x_test, pairs, pair_key_to_idx, n_pairs, F_dim, test_dates,
+    mphdrl_weights = get_mphdrl_test_weights_via_env(
+        mphdrl_model,
+        meta_test,
+        x_test,
+        y_test,
+        pairs,
+        tickers,
+        ticker_to_idx,
+        spread_wide=spread_wide,
     )
     bench_weights = get_all_test_weights(
         bench_model, meta_test, x_test, pairs, pair_key_to_idx, n_pairs, F_dim, test_dates,
     )
     print(f"  MPHDRL dates with weights: {len(mphdrl_weights)}")
     print(f"  Benchmark dates with weights: {len(bench_weights)}")
+    print_zero_weight_diagnostics("MPHDRL", mphdrl_weights)
+    print_zero_weight_diagnostics("Benchmark", bench_weights)
 
     trad_weights: dict = {}
     hedge_path = os.path.join("data", "pickle", "hedge_ratios.pkl")
-    spread_raw_path = os.path.join("data", "spread", "raw.csv")
     if os.path.isfile(hedge_path) and os.path.isfile(spread_raw_path):
         # Same pairs as RL; hedge_ratios.pkl + spread/raw.csv are pipeline outputs (not recomputed).
         trad_params = resolve_traditional_params(args.traditional_params or TRADITIONAL_PARAMS_PATH)
         with open(hedge_path, "rb") as f:
             hedge_ratios = pickle.load(f)
-        spread_wide = load_precomputed_spread_wide(spread_raw_path)
         trad_weights = compute_traditional_weights_by_date(
             valid_dates, pairs, hedge_ratios, trad_params, spread_wide=spread_wide,
         )
