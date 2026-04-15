@@ -446,7 +446,11 @@ class TradingEnvironment:
     def _apply_stop_outs(self, w, sl_actions, spread_values):
         """Zero out pair exposures that have breached the stop magnitude."""
         if sl_actions is None or spread_values is None:
-            return w
+            return np.asarray(w, dtype=np.float64)
+
+        w = np.asarray(w, dtype=np.float64).copy()
+        sl_actions = np.asarray(sl_actions)
+        spread_values = np.asarray(spread_values, dtype=np.float64)
 
         for p in range(self.n_pairs):
             if not np.isfinite(spread_values[p]):
@@ -464,7 +468,8 @@ class TradingEnvironment:
                 self.spread_at_entry[p] = spread_values[p]
                 continue
 
-            mag_idx = int(sl_actions[p]) if sl_actions[p] < len(self.stop_loss_magnitudes) else -1
+            mag_idx = int(sl_actions[p])
+            mag_idx = max(0, min(mag_idx, len(self.stop_loss_magnitudes) - 1))
             stop_mag = float(self.stop_loss_magnitudes[mag_idx])
             deviation = abs(spread_values[p] - self.spread_at_entry[p])
 
@@ -498,7 +503,7 @@ class TradingEnvironment:
 
         if spread_values is None:
             spread_values = self._get_spread_vector(date_t)
-        w = self._apply_stop_outs(w.copy(), sl_actions, spread_values)
+        w = self._apply_stop_outs(np.asarray(w, dtype=np.float64), sl_actions, spread_values)
 
         p_t = self.price_matrix[price_idx_t]
         p_t1 = self.price_matrix[price_idx_t1]
@@ -692,7 +697,7 @@ class MPHDRLTrader(nn.Module):
         sl_actions = sl_actions.reshape(B, P)
 
         w = self.portfolio(h_actor, probs, sl_actions, self.M,
-                           actions=actions, training=False)
+                           actions=actions, training=explore)
 
         return {
             "actions": actions,

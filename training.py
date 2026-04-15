@@ -255,7 +255,7 @@ class MPHDRLTrainer(BaseTrainer):
 
         nstep_buf: list[dict] = []
 
-        def _flush_nstep(next_sw, is_terminal):
+        def _flush_nstep():
             """Emit n-step transition from head of buffer."""
             nonlocal transitions_collected
             if not nstep_buf:
@@ -264,6 +264,7 @@ class MPHDRLTrainer(BaseTrainer):
             for k in range(len(nstep_buf) - 1, -1, -1):
                 G = nstep_buf[k]["reward"] + discount * G
             head = nstep_buf[0]
+            tail = nstep_buf[-1]
             transition = {
                 "state_windows": head["state_windows"],
                 "actions": head["actions"],
@@ -271,8 +272,9 @@ class MPHDRLTrainer(BaseTrainer):
                 "weights": head["weights"],
                 "reward": np.float32(G),
                 "y_spread": head["y_spread"],
-                "next_state_windows": next_sw,
+                "next_state_windows": tail["next_state_windows"],
                 "n_step": len(nstep_buf),
+                "done": np.float32(1.0 if tail["done"] else 0.0),
             }
             self.replay.add(transition)
             transitions_collected += 1
@@ -303,15 +305,17 @@ class MPHDRLTrainer(BaseTrainer):
                 "weights": w_np.astype(np.float32),
                 "reward": float(reward),
                 "y_spread": y_spread.astype(np.float32),
+                "next_state_windows": next_windows.astype(np.float32),
+                "done": bool(done),
             })
 
             if len(nstep_buf) >= n_step:
-                _flush_nstep(next_windows.astype(np.float32), done)
+                _flush_nstep()
                 nstep_buf.pop(0)
 
             if done:
                 while nstep_buf:
-                    _flush_nstep(next_windows.astype(np.float32), True)
+                    _flush_nstep()
                     nstep_buf.pop(0)
                 break
             state_info = next_info
@@ -615,7 +619,7 @@ class BenchmarkTrainer(BaseTrainer):
         discount = HPARAMS["discount_gamma"]
         nstep_buf: list[dict] = []
 
-        def _flush(next_sw, is_terminal):
+        def _flush():
             nonlocal n
             if not nstep_buf:
                 return
@@ -623,25 +627,29 @@ class BenchmarkTrainer(BaseTrainer):
             for k in range(len(nstep_buf) - 1, -1, -1):
                 G = nstep_buf[k]["reward"] + discount * G
             head = nstep_buf[0]
+            tail = nstep_buf[-1]
             self.replay.add({
                 "state_windows": head["state_windows"],
                 "E": head["E"],
                 "reward": np.float32(G),
-                "next_state_windows": next_sw,
-                "done": np.float32(1.0 if is_terminal else 0.0),
+                "next_state_windows": tail["next_state_windows"],
+                "done": np.float32(1.0 if tail["done"] else 0.0),
                 "n_step": len(nstep_buf),
             })
             n += 1
 
         while True:
-            windows, _mask, _y = state_info
+            windows, _mask, y_spread = state_info
             with torch.no_grad():
                 step_out = self.model.forward_step(windows, explore=True)
 
             w_np = step_out["weights"].detach().cpu().numpy().reshape(-1)
             E_np = step_out["pair_exposures"].detach().cpu().numpy().reshape(self.n_pairs)
 
-            next_info, reward, done = self.env.step(w_np)
+            sl_zeros = np.zeros(self.n_pairs, dtype=np.int64)
+            next_info, reward, done = self.env.step(
+                w_np, sl_actions=sl_zeros, spread_values=y_spread,
+            )
             if next_info is not None:
                 next_windows, _, _ = next_info
             else:
@@ -651,15 +659,17 @@ class BenchmarkTrainer(BaseTrainer):
                 "state_windows": windows.astype(np.float32),
                 "E": E_np.astype(np.float32),
                 "reward": float(reward),
+                "next_state_windows": next_windows.astype(np.float32),
+                "done": bool(done),
             })
 
             if len(nstep_buf) >= n_step:
-                _flush(next_windows.astype(np.float32), done)
+                _flush()
                 nstep_buf.pop(0)
 
             if done:
                 while nstep_buf:
-                    _flush(next_windows.astype(np.float32), True)
+                    _flush()
                     nstep_buf.pop(0)
                 break
             state_info = next_info
