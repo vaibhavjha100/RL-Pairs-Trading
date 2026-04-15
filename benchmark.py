@@ -201,8 +201,12 @@ class BenchmarkDDPG(nn.Module):
         assert P == self.n_pairs and Fdim == self.feature_dim
 
         mu = self.actor_mean(w_t)
-        E = self.sample_E(mu, explore)
         mu = torch.nan_to_num(mu, nan=0.0, posinf=0.0, neginf=0.0)
+        # At eval, pure zeros in mu leave no gradient history for M @ w; nudge so pair weights can trade.
+        if not explore and float(mu.detach().abs().max()) < 1e-8:
+            k = torch.arange(self.n_pairs, device=self._device, dtype=mu.dtype)[None, :]
+            mu = mu + 1e-5 * torch.sin(k * (np.pi / max(self.n_pairs, 1)))
+        E = self.sample_E(mu, explore)
         E = torch.nan_to_num(E, nan=0.0, posinf=0.0, neginf=0.0)
         w = pair_exposures_to_weights(E, self.M)
         w = torch.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)

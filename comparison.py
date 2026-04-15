@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 import sys
+from datetime import datetime
 from typing import Any
 
 import numpy as np
@@ -112,29 +113,88 @@ def mean_variance_utility_ann(
     return u, r_ann, v_ann
 
 
+def _normalize_date_column(s: pd.Series) -> pd.Series:
+    """UTC-stripped, calendar-day timestamps for stable merges across CSVs."""
+    return pd.to_datetime(s, utc=True, errors="coerce").dt.tz_localize(None).dt.normalize()
+
+
+def normalize_backtest_df(df: pd.DataFrame, name: str) -> pd.DataFrame:
+    """Sort by date, drop duplicate days, validate required columns."""
+    req = [
+        "date",
+        "gross_portfolio_value",
+        "net_portfolio_value",
+        "gross_portfolio_return",
+        "net_portfolio_return",
+        "transaction_cost",
+        "shorting_cost",
+        "tax_flow",
+    ]
+    missing = [c for c in req if c not in df.columns]
+    if missing:
+        raise ValueError(f"{name}: missing columns {missing}")
+    out = df.copy()
+    out["date"] = _normalize_date_column(out["date"])
+    out = out.dropna(subset=["date"]).sort_values("date")
+    if out["date"].duplicated().any():
+        n_dup = int(out["date"].duplicated().sum())
+        out = out.drop_duplicates(subset=["date"], keep="last")
+        print(
+            f"Warning: {name} had {n_dup} duplicate date row(s); kept last row per day.",
+            file=sys.stderr,
+        )
+    return out.reset_index(drop=True)
+
+
 def rolling_daily_net_utility(
     df: pd.DataFrame, window: int, gamma: float
-) -> pd.Series:
-    """U_t from trailing net returns; index = date. NaN until min_periods met."""
+) -> pd.DataFrame:
+    """
+    U_t from trailing net returns on aligned rows. NaN until min_periods met.
+    Returns a two-column frame (date, rolling_u) for merge-safe alignment (no reindex drift).
+    """
     d = df.sort_values("date").reset_index(drop=True)
     r = d["net_portfolio_return"].astype(float)
     r_ann = r.rolling(window=window, min_periods=2).mean() * 252.0
     v_ann = r.rolling(window=window, min_periods=2).var(ddof=1) * 252.0
     u = r_ann - 0.5 * gamma * v_ann
-    idx = pd.to_datetime(d["date"])
-    return pd.Series(u.values, index=idx)
+    out = pd.DataFrame({"date": _normalize_date_column(d["date"]), "rolling_u": u.values})
+    return out
 
 
 def load_strategy_csv(base_dir: str, filename: str) -> pd.DataFrame | None:
     path = os.path.join(base_dir, filename)
     if not os.path.isfile(path):
         return None
-    return pd.read_csv(path, parse_dates=["date"])
+    df = pd.read_csv(path, encoding="utf-8-sig")
+    df.columns = [c.strip().lstrip("\ufeff") for c in df.columns]
+    if "date" not in df.columns:
+        raise ValueError(f"{path}: no 'date' column (got {list(df.columns)[:8]}...)")
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"])
+    return df
+
+
+def looks_like_flat_returns(df: pd.DataFrame, col: str = "net_portfolio_return") -> bool:
+    r = pd.to_numeric(df[col], errors="coerce").astype(float).values
+    r = r[np.isfinite(r)]
+    if r.size < 2:
+        return True
+    if float(np.nanstd(r, ddof=1)) < 1e-14 and float(np.nanmax(np.abs(r))) < 1e-14:
+        return True
+    return False
 
 
 def summarize(df: pd.DataFrame, name: str) -> dict[str, Any]:
     if df is None or df.empty:
         return {"strategy": name, "ok": False}
+
+    if looks_like_flat_returns(df, "net_portfolio_return"):
+        print(
+            f"Warning: {name} net_portfolio_return is flat (~zero variance). "
+            f"Re-run backtest after training; metrics may look like no trading.",
+            file=sys.stderr,
+        )
 
     g_end = float(df["gross_portfolio_value"].iloc[-1])
     n_end = float(df["net_portfolio_value"].iloc[-1])
@@ -372,16 +432,30 @@ def main() -> None:
         print("--alpha must be in (0, 1)", file=sys.stderr)
         sys.exit(1)
 
+    print("Data sources (run `python backtest.py` before this if metrics look stale):\n")
     loaded: dict[str, pd.DataFrame] = {}
     summaries: list[dict[str, Any]] = []
     for name, fname in STRATEGY_FILES:
+        path = os.path.join(base, fname)
         df = load_strategy_csv(base, fname)
         if df is None:
-            print(f"Missing: {os.path.join(base, fname)}", file=sys.stderr)
+            print(f"Missing: {path}", file=sys.stderr)
             summaries.append({"strategy": name, "ok": False})
         else:
+            try:
+                df = normalize_backtest_df(df, name)
+            except ValueError as e:
+                print(str(e), file=sys.stderr)
+                summaries.append({"strategy": name, "ok": False})
+                continue
             loaded[name] = df
             summaries.append(summarize(df, name))
+            try:
+                mtime = os.path.getmtime(path)
+                ts = datetime.fromtimestamp(mtime).isoformat(timespec="seconds")
+                print(f"Loaded {name}: {os.path.abspath(path)} (modified {ts})")
+            except OSError:
+                print(f"Loaded {name}: {os.path.abspath(path)}")
 
     if not all(s.get("ok") for s in summaries):
         print("All three backtest CSVs are required. Run:  python backtest.py", file=sys.stderr)
@@ -391,25 +465,23 @@ def main() -> None:
     df_bench = loaded["Benchmark RL"].sort_values("date").reset_index(drop=True)
     df_trad = loaded["Traditional pairs"].sort_values("date").reset_index(drop=True)
 
-    u_mph = rolling_daily_net_utility(df_mph, window, gamma)
-    u_bench = rolling_daily_net_utility(df_bench, window, gamma)
-    u_trad = rolling_daily_net_utility(df_trad, window, gamma)
-
-    common = (
-        df_mph[["date"]]
-        .merge(df_bench[["date"]], on="date")
-        .merge(df_trad[["date"]], on="date")
-        .sort_values("date")
+    u_mph = rolling_daily_net_utility(df_mph, window, gamma).rename(columns={"rolling_u": "u_mph"})
+    u_bench = rolling_daily_net_utility(df_bench, window, gamma).rename(
+        columns={"rolling_u": "u_bench"}
     )
-    dates = pd.to_datetime(common["date"]).values
+    u_trad = rolling_daily_net_utility(df_trad, window, gamma).rename(columns={"rolling_u": "u_trad"})
 
-    s_mph = u_mph.reindex(dates).values
-    s_bench = u_bench.reindex(dates).values
-    s_trad = u_trad.reindex(dates).values
-
-    ser_mph = pd.Series(s_mph, index=dates)
-    ser_bench = pd.Series(s_bench, index=dates)
-    ser_trad = pd.Series(s_trad, index=dates)
+    j = u_mph.merge(u_bench, on="date", how="inner").merge(u_trad, on="date", how="inner")
+    if j.empty:
+        print(
+            "Error: no overlapping dates after merging rolling utilities. Check date formats in CSVs.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    dates = j["date"].values
+    ser_mph = pd.Series(j["u_mph"].values, index=dates)
+    ser_bench = pd.Series(j["u_bench"].values, index=dates)
+    ser_trad = pd.Series(j["u_trad"].values, index=dates)
 
     wilcox_rows = [
         run_wilcoxon_mphdrl_greater(ser_mph, ser_bench, "Benchmark RL"),
