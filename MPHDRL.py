@@ -57,6 +57,8 @@ HPARAMS = {
     "discount_gamma": 0.99,
     "stop_loss_magnitudes": [1.5, 2.0, 2.5, 3.0, 3.5],
     "stop_loss_embed_dim": 8,
+    "n_step": 10,
+    "terminal_utility_weight": 1.0,
 }
 
 # Trained weights live under models/<agent>/ (models/ is gitignored).
@@ -66,7 +68,13 @@ MPHDRL_MODEL_DIR = os.path.join("models", "MPHDRL")
 # Segment 0: Data readiness check
 # ============================================================================
 
-def build_pair_ticker_mapping(pairs):
+def build_pair_ticker_mapping(pairs, hedge_ratios=None):
+    """Build pair→ticker incidence matrix M.
+
+    If hedge_ratios is provided (dict keyed by (ticker_a, ticker_b) → beta),
+    rows use +1 on leg A and -beta on leg B so that the portfolio respects the
+    OLS hedge ratio from spread construction.  Falls back to +1/-1 when None.
+    """
     tickers = sorted({t for pair in pairs for t in pair})
     ticker_to_idx = {t: i for i, t in enumerate(tickers)}
     n_pairs = len(pairs)
@@ -74,7 +82,10 @@ def build_pair_ticker_mapping(pairs):
     M = np.zeros((n_pairs, n_tickers), dtype=np.float32)
     for p_idx, (a, b) in enumerate(pairs):
         M[p_idx, ticker_to_idx[a]] = 1.0
-        M[p_idx, ticker_to_idx[b]] = -1.0
+        if hedge_ratios is not None and (a, b) in hedge_ratios:
+            M[p_idx, ticker_to_idx[b]] = -float(hedge_ratios[(a, b)])
+        else:
+            M[p_idx, ticker_to_idx[b]] = -1.0
     return M, tickers, ticker_to_idx
 
 
@@ -127,7 +138,7 @@ def check_data_readiness():
         if not ok:
             all_ok = False
 
-    M, tickers, ticker_to_idx = build_pair_ticker_mapping(pairs)
+    M, tickers, ticker_to_idx = build_pair_ticker_mapping(pairs, hedge_ratios=loaded.get("hedge_ratios"))
     print(f"\n  X_train shape      : {X.shape}")
     print(f"  y_train shape      : {y.shape}")
     print(f"  Pairs              : {len(pairs)}")
@@ -290,12 +301,24 @@ class PortfolioWeightsNetwork(nn.Module):
             nn.Linear(64, 1),
         )
 
-    def forward(self, h_actor, actor_probs, sl_actions, M_tensor):
+    def forward(self, h_actor, actor_probs, sl_actions, M_tensor,
+                actions=None, training=False):
         # h_actor:     (batch, N_pairs, hidden_size)
         # actor_probs: (batch, N_pairs, 3)
         # sl_actions:  (batch, N_pairs) int
         # M_tensor:    (N_pairs, N_tickers) float
-        e_p = (actor_probs[:, :, 0] - actor_probs[:, :, 2]).unsqueeze(-1)  # (batch, N_pairs, 1)
+        # actions:     (batch, N_pairs) int  — discrete argmax actions
+        if actions is not None:
+            oh = F.one_hot(actions.long(), num_classes=3).float()
+            hard_e = (oh[:, :, 0] - oh[:, :, 2]).unsqueeze(-1)
+            if training:
+                soft_e = (actor_probs[:, :, 0] - actor_probs[:, :, 2]).unsqueeze(-1)
+                e_p = (hard_e - soft_e).detach() + soft_e  # straight-through
+            else:
+                e_p = hard_e
+        else:
+            e_p = (actor_probs[:, :, 0] - actor_probs[:, :, 2]).unsqueeze(-1)
+
         sl_emb = self.sl_embedding(sl_actions)  # (batch, N_pairs, sl_embed_dim)
         z_p = torch.cat([h_actor, e_p, sl_emb], dim=-1)  # (batch, N_pairs, pair_embed_dim)
 
@@ -317,13 +340,19 @@ class TradingEnvironment:
     Train-split daily rollouts: windows from spread_X_train, returns from trading
     closes, reward = net return minus HPARAMS-style risk term (§7).
 
-    Pair-level stop-loss hits (§6.2) are not applied to returns yet; sl_actions are
-    reserved for portfolio construction and learning only.
+    On episode termination the final step reward receives an additive
+    terminal utility bonus: ``terminal_utility_weight * U_episode`` where
+    U_episode = mean(return_history)*252 - 0.5*gamma*var(return_history, ddof=1)*252.
+
+    Stop-loss magnitudes are applied to spread deviations; pair exposures are
+    zeroed out when the spread moves beyond the chosen magnitude (§6.2).
     """
 
     def __init__(self, pairs, tickers, ticker_to_idx, trading_raw_path,
                  sequence_meta, X_train, y_train, zeta=0.003, gamma=0.5,
-                 risk_lambda=1.0, var_window=60):
+                 risk_lambda=1.0, var_window=60,
+                 terminal_utility_weight=1.0,
+                 spread_pivot=None):
         self.pairs = pairs
         self.tickers = tickers
         self.ticker_to_idx = ticker_to_idx
@@ -333,6 +362,7 @@ class TradingEnvironment:
         self.gamma = gamma
         self.risk_lambda = risk_lambda
         self.var_window = var_window
+        self.terminal_utility_weight = terminal_utility_weight
 
         raw_df = pd.read_csv(trading_raw_path, parse_dates=["Date"])
         price_wide = raw_df.pivot(index="Date", columns="Ticker", values="Close").sort_index()
@@ -355,14 +385,31 @@ class TradingEnvironment:
         self.y_train = y_train
 
         self.stop_loss_magnitudes = np.array(HPARAMS["stop_loss_magnitudes"])
-        self.return_history = []
+
+        self.pair_key_to_idx = {f"{a}|{b}": i for i, (a, b) in enumerate(pairs)}
+
+        if spread_pivot is not None:
+            self.spread_pivot = spread_pivot
+        else:
+            sp_path = os.path.join("data", "spread", "raw.csv")
+            if os.path.isfile(sp_path):
+                _sp = pd.read_csv(sp_path, parse_dates=["Date"])
+                self.spread_pivot = _sp.pivot(index="Date", columns="Pair", values="spread").sort_index()
+            else:
+                self.spread_pivot = None
+
+        self.return_history: list[float] = []
         self.t = 0
         self.prev_w = np.zeros(self.n_tickers, dtype=np.float64)
+        self.spread_at_entry = np.zeros(self.n_pairs, dtype=np.float64)
+        self.pair_active = np.zeros(self.n_pairs, dtype=bool)
 
     def reset(self):
         self.t = 0
         self.return_history = []
         self.prev_w = np.zeros(self.n_tickers, dtype=np.float64)
+        self.spread_at_entry = np.zeros(self.n_pairs, dtype=np.float64)
+        self.pair_active = np.zeros(self.n_pairs, dtype=bool)
         return self._get_state_windows()
 
     def _get_state_windows(self):
@@ -383,11 +430,59 @@ class TradingEnvironment:
                 y_vec[p_idx] = float(self.y_train[sample_idx])
         return windows, mask, y_vec
 
+    def _get_spread_vector(self, date):
+        """Per-pair close spread on *date*; NaN where unavailable."""
+        sv = np.full(self.n_pairs, np.nan, dtype=np.float64)
+        if self.spread_pivot is None:
+            return sv
+        if date not in self.spread_pivot.index:
+            return sv
+        row = self.spread_pivot.loc[date]
+        for pk, idx in self.pair_key_to_idx.items():
+            if pk in row.index:
+                sv[idx] = float(row[pk])
+        return sv
+
+    def _apply_stop_outs(self, w, sl_actions, spread_values):
+        """Zero out pair exposures that have breached the stop magnitude."""
+        if sl_actions is None or spread_values is None:
+            return w
+
+        for p in range(self.n_pairs):
+            if not np.isfinite(spread_values[p]):
+                continue
+            a, b = self.pairs[p]
+            ia, ib = self.ticker_to_idx[a], self.ticker_to_idx[b]
+            exposure_sign = np.sign(w[ia]) if abs(w[ia]) > 1e-12 else 0.0
+
+            if exposure_sign == 0.0:
+                self.pair_active[p] = False
+                continue
+
+            if not self.pair_active[p]:
+                self.pair_active[p] = True
+                self.spread_at_entry[p] = spread_values[p]
+                continue
+
+            mag_idx = int(sl_actions[p]) if sl_actions[p] < len(self.stop_loss_magnitudes) else -1
+            stop_mag = float(self.stop_loss_magnitudes[mag_idx])
+            deviation = abs(spread_values[p] - self.spread_at_entry[p])
+
+            if deviation > stop_mag:
+                w[ia] = 0.0
+                w[ib] = 0.0
+                self.pair_active[p] = False
+
+        s = np.abs(w).sum()
+        if s > 1e-12:
+            w = w / s
+            w = w - w.mean()
+        else:
+            w = np.zeros_like(w)
+        return w
+
     def step(self, w, sl_actions=None, spread_values=None):
-        """
-        sl_actions / spread_values are reserved for future §6.2 stop-loss simulation
-        against realized spreads; portfolio weights w already reflect stop embeddings.
-        """
+        """Daily step with stop-out enforcement and terminal utility bonus."""
         if self.t + 1 >= len(self.unique_dates):
             return None, 0.0, True
 
@@ -400,6 +495,10 @@ class TradingEnvironment:
         if price_idx_t is None or price_idx_t1 is None:
             self.t += 1
             return self._get_state_windows(), 0.0, False
+
+        if spread_values is None:
+            spread_values = self._get_spread_vector(date_t)
+        w = self._apply_stop_outs(w.copy(), sl_actions, spread_values)
 
         p_t = self.price_matrix[price_idx_t]
         p_t1 = self.price_matrix[price_idx_t1]
@@ -420,10 +519,17 @@ class TradingEnvironment:
             var_r = 0.0
 
         reward = net_return - self.gamma * self.risk_lambda * var_r
+
         self.prev_w = w.copy()
         self.t += 1
         next_state = self._get_state_windows()
         done = next_state is None
+
+        if done and len(self.return_history) >= 2:
+            rh = np.asarray(self.return_history, dtype=np.float64)
+            u_episode = float(np.mean(rh)) * 252.0 - 0.5 * self.gamma * float(np.var(rh, ddof=1)) * 252.0
+            reward += self.terminal_utility_weight * u_episode
+
         return next_state, reward, done
 
     @property
@@ -585,7 +691,8 @@ class MPHDRLTrader(nn.Module):
         probs = probs.reshape(B, P, -1)
         sl_actions = sl_actions.reshape(B, P)
 
-        w = self.portfolio(h_actor, probs, sl_actions, self.M)
+        w = self.portfolio(h_actor, probs, sl_actions, self.M,
+                           actions=actions, training=False)
 
         return {
             "actions": actions,
