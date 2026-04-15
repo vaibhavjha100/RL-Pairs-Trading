@@ -290,8 +290,9 @@ class MPHDRLTrainer(BaseTrainer):
             actions_np = step_out["actions"].detach().cpu().numpy().flatten()
             sl_np = step_out["sl_actions"].detach().cpu().numpy().flatten()
 
+            spread_values = np.where(mask, y_spread, np.nan).astype(np.float64)
             next_info, reward, done = self.env.step(
-                w_np, sl_actions=sl_np, spread_values=y_spread,
+                w_np, sl_actions=sl_np, spread_values=spread_values,
             )
 
             if next_info is not None:
@@ -411,7 +412,8 @@ class MPHDRLTrainer(BaseTrainer):
                 q_sl_target_vals = q_sl_target_vals.reshape(Bp2, P2)
                 rews_expanded = rews.unsqueeze(1).expand_as(q_sl_target_vals)
                 dones_expanded = dones.unsqueeze(1).expand_as(q_sl_target_vals)
-                y_sl = rews_expanded + (1.0 - dones_expanded) * discount_gamma * q_sl_target_vals
+                gamma_n_expanded = gamma_n.unsqueeze(1).expand_as(q_sl_target_vals)
+                y_sl = rews_expanded + (1.0 - dones_expanded) * gamma_n_expanded * q_sl_target_vals
 
         with self._autocast():
             h_s_stop = self.model.encode_all_pairs(sw, self.model.srl_stop)
@@ -646,7 +648,7 @@ class BenchmarkTrainer(BaseTrainer):
             n += 1
 
         while True:
-            windows, _mask, y_spread = state_info
+            windows, mask, y_spread = state_info
             with torch.no_grad():
                 step_out = self.model.forward_step(windows, explore=True)
 
@@ -654,8 +656,9 @@ class BenchmarkTrainer(BaseTrainer):
             E_np = step_out["pair_exposures"].detach().cpu().numpy().reshape(self.n_pairs)
 
             sl_zeros = np.zeros(self.n_pairs, dtype=np.int64)
+            spread_values = np.where(mask, y_spread, np.nan).astype(np.float64)
             next_info, reward, done = self.env.step(
-                w_np, sl_actions=sl_zeros, spread_values=y_spread,
+                w_np, sl_actions=sl_zeros, spread_values=spread_values,
             )
             if next_info is not None:
                 next_windows, _, _ = next_info
