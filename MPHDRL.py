@@ -530,12 +530,15 @@ class TradingEnvironment:
         next_state = self._get_state_windows()
         done = next_state is None
 
-        if done and len(self.return_history) >= 2:
-            rh = np.asarray(self.return_history, dtype=np.float64)
-            u_episode = float(np.mean(rh)) * 252.0 - 0.5 * self.gamma * float(np.var(rh, ddof=1)) * 252.0
-            reward += self.terminal_utility_weight * u_episode
-
         return next_state, reward, done
+
+    def episode_utility_bonus(self):
+        """Terminal utility bonus for one full episode (applied once in trainer)."""
+        if len(self.return_history) < 2:
+            return 0.0
+        rh = np.asarray(self.return_history, dtype=np.float64)
+        u_episode = float(np.mean(rh)) * 252.0 - 0.5 * self.gamma * float(np.var(rh, ddof=1)) * 252.0
+        return self.terminal_utility_weight * u_episode
 
     @property
     def num_steps(self):

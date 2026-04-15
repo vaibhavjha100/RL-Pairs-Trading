@@ -255,7 +255,7 @@ class MPHDRLTrainer(BaseTrainer):
 
         nstep_buf: list[dict] = []
 
-        def _flush_nstep():
+        def _flush_nstep(extra_bonus=0.0):
             """Emit n-step transition from head of buffer."""
             nonlocal transitions_collected
             if not nstep_buf:
@@ -263,6 +263,7 @@ class MPHDRLTrainer(BaseTrainer):
             G = 0.0
             for k in range(len(nstep_buf) - 1, -1, -1):
                 G = nstep_buf[k]["reward"] + discount * G
+            G += float(extra_bonus)
             head = nstep_buf[0]
             tail = nstep_buf[-1]
             transition = {
@@ -314,8 +315,11 @@ class MPHDRLTrainer(BaseTrainer):
                 nstep_buf.pop(0)
 
             if done:
+                terminal_bonus = float(self.env.episode_utility_bonus())
+                bonus_applied = False
                 while nstep_buf:
-                    _flush_nstep()
+                    _flush_nstep(extra_bonus=terminal_bonus if not bonus_applied else 0.0)
+                    bonus_applied = True
                     nstep_buf.pop(0)
                 break
             state_info = next_info
@@ -619,13 +623,14 @@ class BenchmarkTrainer(BaseTrainer):
         discount = HPARAMS["discount_gamma"]
         nstep_buf: list[dict] = []
 
-        def _flush():
+        def _flush(extra_bonus=0.0):
             nonlocal n
             if not nstep_buf:
                 return
             G = 0.0
             for k in range(len(nstep_buf) - 1, -1, -1):
                 G = nstep_buf[k]["reward"] + discount * G
+            G += float(extra_bonus)
             head = nstep_buf[0]
             tail = nstep_buf[-1]
             self.replay.add({
@@ -668,8 +673,11 @@ class BenchmarkTrainer(BaseTrainer):
                 nstep_buf.pop(0)
 
             if done:
+                terminal_bonus = float(self.env.episode_utility_bonus())
+                bonus_applied = False
                 while nstep_buf:
-                    _flush()
+                    _flush(extra_bonus=terminal_bonus if not bonus_applied else 0.0)
+                    bonus_applied = True
                     nstep_buf.pop(0)
                 break
             state_info = next_info
