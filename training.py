@@ -343,6 +343,7 @@ class MPHDRLTrainer(BaseTrainer):
         sls = self._h2d(np.stack([t["stop_loss"] for t in batch]), dtype=torch.int64)
         rews = self._h2d(np.array([t["reward"] for t in batch]))
         nsw = self._h2d(np.stack([t["next_state_windows"] for t in batch]))
+        dones = self._h2d(np.array([t.get("done", 0.0) for t in batch]))
         ns = self._h2d(np.array([t.get("n_step", 1) for t in batch]))
 
         acts_onehot = F.one_hot(acts, num_classes=3).float()
@@ -364,7 +365,7 @@ class MPHDRLTrainer(BaseTrainer):
                 q1_next = self.model.critic1_target(h_nc1.mean(dim=1), next_acts_oh.reshape(Bp, -1))
                 q2_next = self.model.critic2_target(h_nc2.mean(dim=1), next_acts_oh.reshape(Bp, -1))
                 gamma_n = discount_gamma ** ns
-                y_critic = rews + gamma_n * torch.min(q1_next, q2_next)
+                y_critic = rews + (1.0 - dones) * gamma_n * torch.min(q1_next, q2_next)
 
         # -- Critic 1 update --
         with self._autocast():
@@ -409,7 +410,8 @@ class MPHDRLTrainer(BaseTrainer):
                 q_sl_target_vals = q_next_target.gather(1, best_sl_next.unsqueeze(1)).squeeze(1)
                 q_sl_target_vals = q_sl_target_vals.reshape(Bp2, P2)
                 rews_expanded = rews.unsqueeze(1).expand_as(q_sl_target_vals)
-                y_sl = rews_expanded + discount_gamma * q_sl_target_vals
+                dones_expanded = dones.unsqueeze(1).expand_as(q_sl_target_vals)
+                y_sl = rews_expanded + (1.0 - dones_expanded) * discount_gamma * q_sl_target_vals
 
         with self._autocast():
             h_s_stop = self.model.encode_all_pairs(sw, self.model.srl_stop)
