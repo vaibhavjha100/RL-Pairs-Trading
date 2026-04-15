@@ -677,7 +677,10 @@ class MPHDRLTrader(nn.Module):
         return h.reshape(B, P, -1)  # (batch, N_pairs, H)
 
     def forward_step(self, windows, explore=True):
-        windows_t = torch.tensor(windows, dtype=torch.float32, device=self.device)
+        if isinstance(windows, torch.Tensor):
+            windows_t = windows.to(device=self.device, dtype=torch.float32)
+        else:
+            windows_t = torch.as_tensor(np.asarray(windows), dtype=torch.float32, device=self.device)
         if windows_t.dim() == 3:
             windows_t = windows_t.unsqueeze(0)
 
@@ -712,8 +715,11 @@ class MPHDRLTrader(nn.Module):
         }
 
     def compute_critic_values(self, windows, actions_onehot, critic_idx=1):
-        windows_t = torch.tensor(windows, dtype=torch.float32, device=self.device) \
-            if not isinstance(windows, torch.Tensor) else windows
+        windows_t = (
+            windows.to(device=self.device, dtype=torch.float32)
+            if isinstance(windows, torch.Tensor)
+            else torch.as_tensor(np.asarray(windows), dtype=torch.float32, device=self.device)
+        )
         if windows_t.dim() == 3:
             windows_t = windows_t.unsqueeze(0)
 
@@ -728,8 +734,11 @@ class MPHDRLTrader(nn.Module):
         return critic(state_pooled, actions_flat)
 
     def compute_regression(self, windows):
-        windows_t = torch.tensor(windows, dtype=torch.float32, device=self.device) \
-            if not isinstance(windows, torch.Tensor) else windows
+        windows_t = (
+            windows.to(device=self.device, dtype=torch.float32)
+            if isinstance(windows, torch.Tensor)
+            else torch.as_tensor(np.asarray(windows), dtype=torch.float32, device=self.device)
+        )
         if windows_t.dim() == 3:
             windows_t = windows_t.unsqueeze(0)
         h = self.encode_all_pairs(windows_t, self.srl_actor)

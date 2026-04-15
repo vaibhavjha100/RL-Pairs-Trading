@@ -8,6 +8,7 @@ Training logic follows multi_pair_hdrl_trader_architecture.md (TD3 critics,
 DDQN stop-loss head, delayed actor + portfolio + auxiliary regression, PER).
 
 Usage:
+    python training.py --agent Both --epochs 100
     python training.py --agent MPHDRL --epochs 100
     python training.py --agent MPHDRL --epochs 50 --device cuda
     python training.py --agent MPHDRL --epochs 50 --device auto
@@ -101,6 +102,26 @@ def configure_accelerator(device: torch.device) -> None:
         torch.set_float32_matmul_precision("high")
 
 
+def maybe_compile_forward_step(model, device: torch.device, args, sample_windows, tag: str) -> bool:
+    """
+    Try torch.compile on model.forward_step and eagerly run a smoke call.
+    If backend deps (e.g. Triton) are missing, gracefully fall back to eager mode.
+    """
+    if device.type != "cuda" or getattr(args, "no_compile", False) or not hasattr(torch, "compile"):
+        return False
+    eager_forward = model.forward_step
+    try:
+        compiled = torch.compile(eager_forward, mode="default", fullgraph=False)
+        model.forward_step = compiled
+        with torch.no_grad():
+            _ = model.forward_step(sample_windows, explore=True)
+        return True
+    except Exception as e:
+        model.forward_step = eager_forward
+        print(f"[training] torch.compile disabled for {tag}: {e}")
+        return False
+
+
 # ============================================================================
 # Agent trainer registry
 # ============================================================================
@@ -167,21 +188,10 @@ class MPHDRLTrainer(BaseTrainer):
             self._amp_dtype = torch.float32
             self._scaler = None
 
-        if self.device.type == "cuda" and not getattr(args, "no_compile", False) and hasattr(
-            torch, "compile"
-        ):
-            try:
-                self.model.forward_step = torch.compile(
-                    self.model.forward_step,
-                    mode="default",
-                    fullgraph=False,
-                )
-                self._forward_compiled = True
-            except Exception as e:
-                print(f"[training] torch.compile skipped: {e}")
-                self._forward_compiled = False
-        else:
-            self._forward_compiled = False
+        sample_windows = data["X_train"][0]
+        self._forward_compiled = maybe_compile_forward_step(
+            self.model, self.device, args, sample_windows, tag="MPHDRL"
+        )
 
         self.env = TradingEnvironment(
             pairs=data["pairs"],
@@ -574,6 +584,25 @@ class BenchmarkTrainer(BaseTrainer):
         self.model = BenchmarkDDPG(
             F_dim, n_pairs, n_tickers, data["M"], device=str(self.device)
         )
+        self.use_amp = self.device.type == "cuda" and not getattr(args, "no_amp", False)
+        if (
+            self.use_amp
+            and hasattr(torch.cuda, "is_bf16_supported")
+            and torch.cuda.is_bf16_supported()
+        ):
+            self._amp_dtype = torch.bfloat16
+            self._scaler = None
+        elif self.use_amp:
+            self._amp_dtype = torch.float16
+            self._scaler = torch.amp.GradScaler("cuda", enabled=True)
+        else:
+            self._amp_dtype = torch.float32
+            self._scaler = None
+
+        sample_windows = data["X_train"][0]
+        self._forward_compiled = maybe_compile_forward_step(
+            self.model, self.device, args, sample_windows, tag="Benchmark"
+        )
 
         self.env = TradingEnvironment(
             pairs=data["pairs"],
@@ -609,6 +638,11 @@ class BenchmarkTrainer(BaseTrainer):
             betas=(0.9, 0.999),
             eps=1e-7,
         )
+
+    def _autocast(self):
+        if self.use_amp:
+            return torch.amp.autocast("cuda", dtype=self._amp_dtype)
+        return contextlib.nullcontext()
 
     def _h2d(self, arr, dtype=torch.float32):
         dev = self.model.device
@@ -704,36 +738,50 @@ class BenchmarkTrainer(BaseTrainer):
         ns = self._h2d(np.array([t.get("n_step", 1) for t in batch]))
 
         with torch.no_grad():
-            mu_next = self.model.actor_mean_target(nsw)
-            q_next = self.model.critic_q(
-                nsw, mu_next, self.model.critic_encoder_t, self.model.critic_head_t
-            )
-            gamma_n = gamma ** ns
-            y = rews + (1.0 - dones) * gamma_n * q_next
+            with self._autocast():
+                mu_next = self.model.actor_mean_target(nsw)
+                q_next = self.model.critic_q(
+                    nsw, mu_next, self.model.critic_encoder_t, self.model.critic_head_t
+                )
+                gamma_n = gamma ** ns
+                y = rews + (1.0 - dones) * gamma_n * q_next
 
-        q = self.model.critic_q(sw, E, self.model.critic_encoder, self.model.critic_head)
-        loss_c = F.mse_loss(q, y)
+        with self._autocast():
+            q = self.model.critic_q(sw, E, self.model.critic_encoder, self.model.critic_head)
+            loss_c = F.mse_loss(q, y)
         self.opt_critic.zero_grad()
-        loss_c.backward()
-        self.opt_critic.step()
+        if self._scaler is not None:
+            self._scaler.scale(loss_c).backward()
+            self._scaler.step(self.opt_critic)
+        else:
+            loss_c.backward()
+            self.opt_critic.step()
 
         for p in self.model.critic_encoder.parameters():
             p.requires_grad = False
         for p in self.model.critic_head.parameters():
             p.requires_grad = False
 
-        mu = self.model.actor_mean(sw)
-        q_a = self.model.critic_q(sw, mu, self.model.critic_encoder, self.model.critic_head)
-        loss_a = -q_a.mean()
+        with self._autocast():
+            mu = self.model.actor_mean(sw)
+            q_a = self.model.critic_q(sw, mu, self.model.critic_encoder, self.model.critic_head)
+            loss_a = -q_a.mean()
 
         self.opt_actor.zero_grad()
-        loss_a.backward()
-        self.opt_actor.step()
+        if self._scaler is not None:
+            self._scaler.scale(loss_a).backward()
+            self._scaler.step(self.opt_actor)
+        else:
+            loss_a.backward()
+            self.opt_actor.step()
 
         for p in self.model.critic_encoder.parameters():
             p.requires_grad = True
         for p in self.model.critic_head.parameters():
             p.requires_grad = True
+
+        if self._scaler is not None:
+            self._scaler.update()
 
         self.model.soft_update()
 
@@ -742,7 +790,12 @@ class BenchmarkTrainer(BaseTrainer):
     def train(self):
         print(f"\n{'=' * 60}")
         print(f"Training Benchmark (DDPG-style) agent for {self.epochs} epochs")
-        print(f"Device: {self.device} ({self.device.type}) | Pairs: {self.n_pairs}")
+        speed = []
+        if self.device.type == "cuda":
+            speed.append(f"AMP={self._amp_dtype}" if self.use_amp else "AMP=off")
+            speed.append("compile=on" if getattr(self, "_forward_compiled", False) else "compile=off")
+        speed_s = (" | " + ", ".join(speed)) if speed else ""
+        print(f"Device: {self.device} ({self.device.type}) | Pairs: {self.n_pairs}{speed_s}")
         print(f"{'=' * 60}\n")
 
         for epoch in range(1, self.epochs + 1):
@@ -778,9 +831,9 @@ class BenchmarkTrainer(BaseTrainer):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="RL Pairs Trading -- Training Harness")
-    parser.add_argument("--agent", type=str, default="MPHDRL",
-                        choices=list(AGENT_REGISTRY.keys()),
-                        help="Agent type to train (default: MPHDRL)")
+    parser.add_argument("--agent", type=str, default="Both",
+                        choices=list(AGENT_REGISTRY.keys()) + ["Both"],
+                        help="Agent type to train: MPHDRL, Benchmark, or Both (default: Both)")
     parser.add_argument("--epochs", type=int, default=100,
                         help="Number of training epochs (default: 100)")
     parser.add_argument("--device", type=str, default="auto",
@@ -817,13 +870,19 @@ def main():
         print("Data readiness failed. Run the preprocessing pipeline first.")
         sys.exit(1)
 
-    trainer_cls = AGENT_REGISTRY.get(args.agent)
-    if trainer_cls is None:
-        print(f"Unknown agent: {args.agent}. Available: {list(AGENT_REGISTRY.keys())}")
-        sys.exit(1)
+    if args.agent == "Both":
+        agent_order = ["MPHDRL", "Benchmark"]
+    else:
+        agent_order = [args.agent]
 
-    trainer = trainer_cls(args, data)
-    trainer.train()
+    for agent_name in agent_order:
+        trainer_cls = AGENT_REGISTRY.get(agent_name)
+        if trainer_cls is None:
+            print(f"Unknown agent: {agent_name}. Available: {list(AGENT_REGISTRY.keys())}")
+            sys.exit(1)
+        print(f"\nStarting trainer: {agent_name}")
+        trainer = trainer_cls(args, data)
+        trainer.train()
 
 
 if __name__ == "__main__":

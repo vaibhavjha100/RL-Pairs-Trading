@@ -180,7 +180,7 @@ class BenchmarkDDPG(nn.Module):
         Placeholder keys for scripts that expect MPHDRL dict shape.
         """
         if not isinstance(windows, torch.Tensor):
-            w_t = torch.tensor(windows, dtype=torch.float32, device=self._device)
+            w_t = torch.as_tensor(np.asarray(windows), dtype=torch.float32, device=self._device)
         else:
             w_t = windows.to(dtype=torch.float32, device=self._device)
         if w_t.dim() == 3:
