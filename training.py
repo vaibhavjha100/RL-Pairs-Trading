@@ -316,10 +316,10 @@ class MPHDRLTrainer(BaseTrainer):
 
             if done:
                 terminal_bonus = float(self.env.episode_utility_bonus())
-                bonus_applied = False
+                n_tail = max(len(nstep_buf), 1)
+                bonus_share = terminal_bonus / n_tail
                 while nstep_buf:
-                    _flush_nstep(extra_bonus=terminal_bonus if not bonus_applied else 0.0)
-                    bonus_applied = True
+                    _flush_nstep(extra_bonus=bonus_share)
                     nstep_buf.pop(0)
                 break
             state_info = next_info
@@ -676,10 +676,10 @@ class BenchmarkTrainer(BaseTrainer):
 
             if done:
                 terminal_bonus = float(self.env.episode_utility_bonus())
-                bonus_applied = False
+                n_tail = max(len(nstep_buf), 1)
+                bonus_share = terminal_bonus / n_tail
                 while nstep_buf:
-                    _flush(extra_bonus=terminal_bonus if not bonus_applied else 0.0)
-                    bonus_applied = True
+                    _flush(extra_bonus=bonus_share)
                     nstep_buf.pop(0)
                 break
             state_info = next_info
