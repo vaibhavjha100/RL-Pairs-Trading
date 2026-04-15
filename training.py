@@ -195,7 +195,9 @@ class MPHDRLTrainer(BaseTrainer):
             gamma=HPARAMS["gamma"],
             risk_lambda=HPARAMS["risk_lambda"],
             var_window=HPARAMS["var_window"],
+            terminal_utility_weight=HPARAMS["terminal_utility_weight"],
         )
+        self.n_step = HPARAMS["n_step"]
 
         buffer_cap = max(10000, self.env.num_steps * 2)
         self.replay = PrioritizedReplayBuffer(
@@ -248,6 +250,32 @@ class MPHDRLTrainer(BaseTrainer):
         if state_info is None:
             return 0
         transitions_collected = 0
+        n_step = self.n_step
+        discount = HPARAMS["discount_gamma"]
+
+        nstep_buf: list[dict] = []
+
+        def _flush_nstep(next_sw, is_terminal):
+            """Emit n-step transition from head of buffer."""
+            nonlocal transitions_collected
+            if not nstep_buf:
+                return
+            G = 0.0
+            for k in range(len(nstep_buf) - 1, -1, -1):
+                G = nstep_buf[k]["reward"] + discount * G
+            head = nstep_buf[0]
+            transition = {
+                "state_windows": head["state_windows"],
+                "actions": head["actions"],
+                "stop_loss": head["stop_loss"],
+                "weights": head["weights"],
+                "reward": np.float32(G),
+                "y_spread": head["y_spread"],
+                "next_state_windows": next_sw,
+                "n_step": len(nstep_buf),
+            }
+            self.replay.add(transition)
+            transitions_collected += 1
 
         while True:
             windows, mask, y_spread = state_info
@@ -259,26 +287,32 @@ class MPHDRLTrainer(BaseTrainer):
             actions_np = step_out["actions"].detach().cpu().numpy().flatten()
             sl_np = step_out["sl_actions"].detach().cpu().numpy().flatten()
 
-            next_info, reward, done = self.env.step(w_np)
+            next_info, reward, done = self.env.step(
+                w_np, sl_actions=sl_np, spread_values=y_spread,
+            )
 
             if next_info is not None:
                 next_windows, next_mask, _next_y = next_info
             else:
                 next_windows = np.zeros_like(windows)
 
-            transition = {
+            nstep_buf.append({
                 "state_windows": windows.astype(np.float32),
                 "actions": actions_np.astype(np.int64),
                 "stop_loss": sl_np.astype(np.int64),
                 "weights": w_np.astype(np.float32),
-                "reward": np.float32(reward),
+                "reward": float(reward),
                 "y_spread": y_spread.astype(np.float32),
-                "next_state_windows": next_windows.astype(np.float32),
-            }
-            self.replay.add(transition)
-            transitions_collected += 1
+            })
+
+            if len(nstep_buf) >= n_step:
+                _flush_nstep(next_windows.astype(np.float32), done)
+                nstep_buf.pop(0)
 
             if done:
+                while nstep_buf:
+                    _flush_nstep(next_windows.astype(np.float32), True)
+                    nstep_buf.pop(0)
                 break
             state_info = next_info
 
@@ -301,10 +335,11 @@ class MPHDRLTrainer(BaseTrainer):
         sls = self._h2d(np.stack([t["stop_loss"] for t in batch]), dtype=torch.int64)
         rews = self._h2d(np.array([t["reward"] for t in batch]))
         nsw = self._h2d(np.stack([t["next_state_windows"] for t in batch]))
+        ns = self._h2d(np.array([t.get("n_step", 1) for t in batch]))
 
         acts_onehot = F.one_hot(acts, num_classes=3).float()
 
-        # -- Target actions (smoothed) --
+        # -- Target actions (smoothed) with n-step discount --
         with torch.no_grad():
             with self._autocast():
                 h_next_actor = self.model.encode_all_pairs(nsw, self.model.srl_actor_target)
@@ -320,7 +355,8 @@ class MPHDRLTrainer(BaseTrainer):
                 h_nc2 = self.model.encode_all_pairs(nsw, self.model.srl_critic2_target)
                 q1_next = self.model.critic1_target(h_nc1.mean(dim=1), next_acts_oh.reshape(Bp, -1))
                 q2_next = self.model.critic2_target(h_nc2.mean(dim=1), next_acts_oh.reshape(Bp, -1))
-                y_critic = rews + discount_gamma * torch.min(q1_next, q2_next)
+                gamma_n = discount_gamma ** ns
+                y_critic = rews + gamma_n * torch.min(q1_next, q2_next)
 
         # -- Critic 1 update --
         with self._autocast():
@@ -390,13 +426,17 @@ class MPHDRLTrainer(BaseTrainer):
                 h_a = self.model.encode_all_pairs(sw, self.model.srl_actor)
                 Ba, Pa, Ha = h_a.shape
                 logits_a = self.model.actor(h_a.reshape(Ba * Pa, Ha))
-                probs_a = F.softmax(logits_a, dim=-1)
-                # Differentiable policy signal: expected soft action (§5.3, §8.3 spirit).
-                # Critics are trained on stored one-hot actions; actor step uses soft probs.
-                soft_actions = probs_a.reshape(Ba, Pa * 3)
+                probs_a = F.softmax(logits_a, dim=-1).reshape(Ba, Pa, 3)
+                actions_a = probs_a.argmax(dim=-1)
+
+                # Straight-through hard actions in critic input (one-hot)
+                oh_a = F.one_hot(actions_a, num_classes=3).float()
+                soft_flat = probs_a.reshape(Ba, Pa * 3)
+                hard_flat = oh_a.reshape(Ba, Pa * 3)
+                st_actions = (hard_flat - soft_flat).detach() + soft_flat
 
                 h_c1_for_actor = self.model.encode_all_pairs(sw, self.model.srl_critic1)
-                q_for_actor = self.model.critic1(h_c1_for_actor.mean(dim=1), soft_actions)
+                q_for_actor = self.model.critic1(h_c1_for_actor.mean(dim=1), st_actions)
                 loss_actor_pg = -q_for_actor.mean()
 
                 # Regression loss (§1.4, §8.5): per-pair label from same row as state window.
@@ -535,7 +575,9 @@ class BenchmarkTrainer(BaseTrainer):
             gamma=HPARAMS["gamma"],
             risk_lambda=HPARAMS["risk_lambda"],
             var_window=HPARAMS["var_window"],
+            terminal_utility_weight=HPARAMS["terminal_utility_weight"],
         )
+        self.n_step = HPARAMS["n_step"]
 
         buffer_cap = max(10000, self.env.num_steps * 2)
         self.replay = UniformReplayBuffer(buffer_cap)
@@ -569,6 +611,28 @@ class BenchmarkTrainer(BaseTrainer):
         if state_info is None:
             return 0
         n = 0
+        n_step = self.n_step
+        discount = HPARAMS["discount_gamma"]
+        nstep_buf: list[dict] = []
+
+        def _flush(next_sw, is_terminal):
+            nonlocal n
+            if not nstep_buf:
+                return
+            G = 0.0
+            for k in range(len(nstep_buf) - 1, -1, -1):
+                G = nstep_buf[k]["reward"] + discount * G
+            head = nstep_buf[0]
+            self.replay.add({
+                "state_windows": head["state_windows"],
+                "E": head["E"],
+                "reward": np.float32(G),
+                "next_state_windows": next_sw,
+                "done": np.float32(1.0 if is_terminal else 0.0),
+                "n_step": len(nstep_buf),
+            })
+            n += 1
+
         while True:
             windows, _mask, _y = state_info
             with torch.no_grad():
@@ -583,17 +647,20 @@ class BenchmarkTrainer(BaseTrainer):
             else:
                 next_windows = np.zeros_like(windows)
 
-            self.replay.add(
-                {
-                    "state_windows": windows.astype(np.float32),
-                    "E": E_np.astype(np.float32),
-                    "reward": np.float32(reward),
-                    "next_state_windows": next_windows.astype(np.float32),
-                    "done": np.float32(1.0 if done else 0.0),
-                }
-            )
-            n += 1
+            nstep_buf.append({
+                "state_windows": windows.astype(np.float32),
+                "E": E_np.astype(np.float32),
+                "reward": float(reward),
+            })
+
+            if len(nstep_buf) >= n_step:
+                _flush(next_windows.astype(np.float32), done)
+                nstep_buf.pop(0)
+
             if done:
+                while nstep_buf:
+                    _flush(next_windows.astype(np.float32), True)
+                    nstep_buf.pop(0)
                 break
             state_info = next_info
         return n
@@ -611,13 +678,15 @@ class BenchmarkTrainer(BaseTrainer):
         rews = self._h2d(np.array([t["reward"] for t in batch]))
         nsw = self._h2d(np.stack([t["next_state_windows"] for t in batch]))
         dones = self._h2d(np.array([t["done"] for t in batch]))
+        ns = self._h2d(np.array([t.get("n_step", 1) for t in batch]))
 
         with torch.no_grad():
             mu_next = self.model.actor_mean_target(nsw)
             q_next = self.model.critic_q(
                 nsw, mu_next, self.model.critic_encoder_t, self.model.critic_head_t
             )
-            y = rews + (1.0 - dones) * gamma * q_next
+            gamma_n = gamma ** ns
+            y = rews + (1.0 - dones) * gamma_n * q_next
 
         q = self.model.critic_q(sw, E, self.model.critic_encoder, self.model.critic_head)
         loss_c = F.mse_loss(q, y)

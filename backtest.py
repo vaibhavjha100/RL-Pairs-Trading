@@ -371,7 +371,12 @@ def main():
 
     # --- Load test spread data ---
     x_test, y_test, pairs, meta_test = load_test_bundle()
-    M, tickers, ticker_to_idx = build_pair_ticker_mapping(pairs)
+    hedge_path_for_M = os.path.join("data", "pickle", "hedge_ratios.pkl")
+    _hr = None
+    if os.path.isfile(hedge_path_for_M):
+        with open(hedge_path_for_M, "rb") as f:
+            _hr = pickle.load(f)
+    M, tickers, ticker_to_idx = build_pair_ticker_mapping(pairs, hedge_ratios=_hr)
     n_pairs = len(pairs)
     n_tickers = len(tickers)
     F_dim = x_test.shape[2]
