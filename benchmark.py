@@ -185,6 +185,7 @@ class BenchmarkDDPG(nn.Module):
         self,
         windows: np.ndarray | torch.Tensor,
         explore: bool = True,
+        pair_mask: np.ndarray | torch.Tensor | None = None,
     ) -> Dict[str, Any]:
         """
         MPHDRL-compatible keys: weights (B, n_tickers), plus pair_exposures for replay.
@@ -208,6 +209,11 @@ class BenchmarkDDPG(nn.Module):
             mu = mu + 1e-5 * torch.sin(k * (np.pi / max(self.n_pairs, 1)))
         E = self.sample_E(mu, explore)
         E = torch.nan_to_num(E, nan=0.0, posinf=0.0, neginf=0.0)
+        if pair_mask is not None:
+            pm = torch.as_tensor(np.asarray(pair_mask), dtype=E.dtype, device=self._device)
+            if pm.dim() == 1:
+                pm = pm.unsqueeze(0)
+            E = E * pm
         w = pair_exposures_to_weights(E, self.M)
         w = torch.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
 

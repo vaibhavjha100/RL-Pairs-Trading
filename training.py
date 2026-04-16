@@ -13,6 +13,7 @@ Usage:
     python training.py --agent MPHDRL --epochs 50 --device cuda
     python training.py --agent MPHDRL --epochs 50 --device auto
     python training.py --agent Benchmark --epochs 100 --device cuda
+    python training.py --env-diagnostic-no-risk-tax  # diagnostic: no variance/tax/terminal bonus; costs on
 
 On CUDA (default): cudnn benchmark, TF32, fast H2D copies, mixed precision (bfloat16
 if supported else float16 + GradScaler), and torch.compile on forward_step unless
@@ -193,6 +194,7 @@ class MPHDRLTrainer(BaseTrainer):
             self.model, self.device, args, sample_windows, tag="MPHDRL"
         )
 
+        _diag = getattr(args, "env_diagnostic_no_risk_tax", False)
         self.env = TradingEnvironment(
             pairs=data["pairs"],
             tickers=data["tickers"],
@@ -205,7 +207,9 @@ class MPHDRLTrainer(BaseTrainer):
             gamma=HPARAMS["gamma"],
             risk_lambda=HPARAMS["risk_lambda"],
             var_window=HPARAMS["var_window"],
-            terminal_utility_weight=HPARAMS["terminal_utility_weight"],
+            terminal_utility_weight=0.0 if _diag else HPARAMS["terminal_utility_weight"],
+            use_stop_loss=True,
+            diagnostic_no_risk_tax=_diag,
         )
         self.n_step = HPARAMS["n_step"]
 
@@ -294,7 +298,7 @@ class MPHDRLTrainer(BaseTrainer):
             windows, mask, y_spread = state_info
             with torch.no_grad():
                 with self._autocast():
-                    step_out = self.model.forward_step(windows, explore=True)
+                    step_out = self.model.forward_step(windows, explore=True, pair_mask=mask)
 
             w_np = step_out["weights"].detach().cpu().numpy().flatten()
             actions_np = step_out["actions"].detach().cpu().numpy().flatten()
@@ -604,6 +608,7 @@ class BenchmarkTrainer(BaseTrainer):
             self.model, self.device, args, sample_windows, tag="Benchmark"
         )
 
+        _diag = getattr(args, "env_diagnostic_no_risk_tax", False)
         self.env = TradingEnvironment(
             pairs=data["pairs"],
             tickers=data["tickers"],
@@ -616,7 +621,9 @@ class BenchmarkTrainer(BaseTrainer):
             gamma=HPARAMS["gamma"],
             risk_lambda=HPARAMS["risk_lambda"],
             var_window=HPARAMS["var_window"],
-            terminal_utility_weight=HPARAMS["terminal_utility_weight"],
+            terminal_utility_weight=0.0 if _diag else HPARAMS["terminal_utility_weight"],
+            use_stop_loss=False,
+            diagnostic_no_risk_tax=_diag,
         )
         self.n_step = HPARAMS["n_step"]
 
@@ -696,15 +703,14 @@ class BenchmarkTrainer(BaseTrainer):
         while True:
             windows, mask, y_spread = state_info
             with torch.no_grad():
-                step_out = self.model.forward_step(windows, explore=True)
+                step_out = self.model.forward_step(windows, explore=True, pair_mask=mask)
 
             w_np = step_out["weights"].detach().cpu().numpy().reshape(-1)
             E_np = step_out["pair_exposures"].detach().cpu().numpy().reshape(self.n_pairs)
 
-            sl_zeros = np.zeros(self.n_pairs, dtype=np.int64)
             spread_values = np.where(mask, y_spread, np.nan).astype(np.float64)
             next_info, reward, done = self.env.step(
-                w_np, sl_actions=sl_zeros, spread_values=spread_values,
+                w_np, sl_actions=None, spread_values=None,
             )
             if next_info is not None:
                 next_windows, _, _ = next_info
@@ -924,6 +930,15 @@ def parse_args():
                         help="Disable CUDA mixed precision (default: AMP on when using CUDA)")
     parser.add_argument("--no-compile", action="store_true",
                         help="Disable torch.compile on forward_step (default: compile on CUDA)")
+    parser.add_argument(
+        "--env-diagnostic-no-risk-tax",
+        action="store_true",
+        dest="env_diagnostic_no_risk_tax",
+        help=(
+            "Training env: net reward without variance penalty; no STCG tax flows; "
+            "terminal utility bonus off; txn and shorting costs unchanged (diagnostic runs)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -942,6 +957,8 @@ def main():
             f"Speed opts: AMP={'off' if args.no_amp else 'on (bf16 or fp16+scaler)'}, "
             f"torch.compile={'off' if args.no_compile else 'on (forward_step)'}"
         )
+    if getattr(args, "env_diagnostic_no_risk_tax", False):
+        print("Env diagnostic: no variance penalty in reward, no taxes, no terminal bonus; costs on.")
     print("=" * 60)
 
     print("\nChecking data readiness...")

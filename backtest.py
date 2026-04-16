@@ -68,6 +68,8 @@ RESULT_COLUMNS = [
     "net_short_return",
     "net_portfolio_value",
     "net_portfolio_return",
+    "mean_abs_weight",
+    "l1_turnover",
 ]
 
 # ---------------------------------------------------------------------------
@@ -138,9 +140,11 @@ def _default_ckpt(model_dir):
 # Model weight extraction for all test dates
 # ---------------------------------------------------------------------------
 
-def _windows_for_date(meta_test, x_test, pair_key_to_idx, n_pairs, F_dim, d):
+def windows_and_mask_for_date(meta_test, x_test, pair_key_to_idx, n_pairs, F_dim, d):
+    """Aligned windows and per-pair mask (1 = valid sequence for that date)."""
     sub = meta_test[meta_test["target_date"] == d]
     windows = np.zeros((n_pairs, x_test.shape[1], F_dim), dtype=np.float32)
+    mask = np.zeros(n_pairs, dtype=np.float32)
     present = []
     for _, row in sub.iterrows():
         iloc = row.name
@@ -149,10 +153,11 @@ def _windows_for_date(meta_test, x_test, pair_key_to_idx, n_pairs, F_dim, d):
             continue
         p_idx = pair_key_to_idx[pkey]
         windows[p_idx] = x_test[iloc]
+        mask[p_idx] = 1.0
         present.append(pkey)
     if not present:
-        return None
-    return windows
+        return None, None
+    return windows, mask
 
 
 def get_all_test_weights(model, meta_test, x_test, pairs, pair_key_to_idx, n_pairs, F_dim, dates):
@@ -160,11 +165,13 @@ def get_all_test_weights(model, meta_test, x_test, pairs, pair_key_to_idx, n_pai
     weights_by_date = {}
     model.eval()
     for d in dates:
-        windows = _windows_for_date(meta_test, x_test, pair_key_to_idx, n_pairs, F_dim, d)
+        windows, mask = windows_and_mask_for_date(
+            meta_test, x_test, pair_key_to_idx, n_pairs, F_dim, d,
+        )
         if windows is None:
             continue
         with torch.no_grad():
-            out = model.forward_step(windows, explore=False)
+            out = model.forward_step(windows, explore=False, pair_mask=mask)
         w = out["weights"].detach().cpu().numpy().reshape(-1)
         weights_by_date[d] = w
     return weights_by_date
@@ -212,7 +219,7 @@ def get_mphdrl_test_weights_via_env(
         d_t = env.unique_dates[env.t]
         windows, mask, y_spread = state
         with torch.no_grad():
-            out = model.forward_step(windows, explore=False)
+            out = model.forward_step(windows, explore=False, pair_mask=mask)
 
         raw_w = out["weights"].detach().cpu().numpy().reshape(-1)
         sl_actions = out["sl_actions"].detach().cpu().numpy().reshape(-1)
@@ -364,6 +371,7 @@ def run_strategy_backtest(strategy_name, weights_by_date, price_wide, tickers, t
 
         net_pv += net_pnl
 
+        mean_abs_w = float(np.nanmean(np.abs(w)))
         rows.append({
             "date": d_t,
             "gross_portfolio_value": gross_pv,
@@ -382,6 +390,8 @@ def run_strategy_backtest(strategy_name, weights_by_date, price_wide, tickers, t
             "net_short_return": net_short_ret,
             "net_portfolio_value": net_pv,
             "net_portfolio_return": net_portfolio_ret,
+            "mean_abs_weight": mean_abs_w,
+            "l1_turnover": float(total_turnover),
         })
 
         prev_w = w.copy()
@@ -575,6 +585,11 @@ def main():
         print(f"    Total txn:    {total_txn:>14,.2f}")
         print(f"    Total short:  {total_short:>14,.2f}")
         print(f"    Total tax:    {total_tax:>14,.2f}")
+        if "mean_abs_weight" in df.columns and "l1_turnover" in df.columns:
+            print(
+                f"    Mean |w|:    {df['mean_abs_weight'].mean():>14.6f}  "
+                f"  Mean L1 turnover: {df['l1_turnover'].mean():>10.6f}"
+            )
     print("=" * 60)
 
 

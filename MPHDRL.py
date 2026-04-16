@@ -302,12 +302,13 @@ class PortfolioWeightsNetwork(nn.Module):
         )
 
     def forward(self, h_actor, actor_probs, sl_actions, M_tensor,
-                actions=None, training=False):
+                actions=None, training=False, pair_mask=None):
         # h_actor:     (batch, N_pairs, hidden_size)
         # actor_probs: (batch, N_pairs, 3)
         # sl_actions:  (batch, N_pairs) int
         # M_tensor:    (N_pairs, N_tickers) float
         # actions:     (batch, N_pairs) int  — discrete argmax actions
+        # pair_mask:   (batch, N_pairs) optional; 0 => pair cannot trade
         if actions is not None:
             oh = F.one_hot(actions.long(), num_classes=3).float()
             hard_e = (oh[:, :, 0] - oh[:, :, 2]).unsqueeze(-1)
@@ -323,6 +324,11 @@ class PortfolioWeightsNetwork(nn.Module):
         z_p = torch.cat([h_actor, e_p, sl_emb], dim=-1)  # (batch, N_pairs, pair_embed_dim)
 
         E = self.pair_mlp(z_p).squeeze(-1)  # (batch, N_pairs)
+        if pair_mask is not None:
+            m = pair_mask.to(dtype=E.dtype, device=E.device)
+            if m.dim() == 1:
+                m = m.unsqueeze(0)
+            E = E * m
         u = torch.matmul(E, M_tensor)  # (batch, N_tickers)
 
         # L1 normalization + market-neutral de-meaning
@@ -357,7 +363,9 @@ class TradingEnvironment:
                  txn_cost_rate=0.0000307,
                  short_cost_annual=0.0657,
                  stcg_rate=0.20,
-                 fiscal_year_end=(3, 31)):
+                 fiscal_year_end=(3, 31),
+                 use_stop_loss=True,
+                 diagnostic_no_risk_tax=False):
         self.pairs = pairs
         self.tickers = tickers
         self.ticker_to_idx = ticker_to_idx
@@ -372,6 +380,8 @@ class TradingEnvironment:
         self.short_cost_daily = float(short_cost_annual) / 252.0
         self.stcg_rate = float(stcg_rate)
         self.fiscal_year_end = fiscal_year_end
+        self.use_stop_loss = bool(use_stop_loss)
+        self.diagnostic_no_risk_tax = bool(diagnostic_no_risk_tax)
 
         raw_df = pd.read_csv(trading_raw_path, parse_dates=["Date"])
         price_wide = raw_df.pivot(index="Date", columns="Ticker", values="Close").sort_index()
@@ -540,7 +550,10 @@ class TradingEnvironment:
 
         if spread_values is None:
             spread_values = self._get_spread_vector(date_t)
-        w = self._apply_stop_outs(np.asarray(w, dtype=np.float64), sl_actions, spread_values)
+        if self.use_stop_loss:
+            w = self._apply_stop_outs(np.asarray(w, dtype=np.float64), sl_actions, spread_values)
+        else:
+            w = np.asarray(w, dtype=np.float64)
 
         p_t = self.price_matrix[price_idx_t]
         p_t1 = self.price_matrix[price_idx_t1]
@@ -574,7 +587,9 @@ class TradingEnvironment:
         realized_gross_ret = self._compute_realized_ret(self.prev_w, w, raw_returns)
         net_realized_ret = realized_gross_ret - txn_cost_ret - shorting_cost_ret
 
-        if net_realized_ret > 0:
+        if self.diagnostic_no_risk_tax:
+            tax_flow_ret = 0.0
+        elif net_realized_ret > 0:
             payment = net_realized_ret * self.stcg_rate
             tax_flow_ret = -payment
             self.tax_carryforward += payment
@@ -586,7 +601,9 @@ class TradingEnvironment:
         else:
             tax_flow_ret = 0.0
 
-        if self.prev_date is not None and self._crosses_fiscal_year(self.prev_date, date_t):
+        if not self.diagnostic_no_risk_tax and self.prev_date is not None and self._crosses_fiscal_year(
+            self.prev_date, date_t
+        ):
             self.tax_carryforward = 0.0
 
         tax_per_leg_ret = tax_flow_ret / 2.0
@@ -602,7 +619,10 @@ class TradingEnvironment:
         else:
             var_r = 0.0
 
-        reward = net_return - self.gamma * self.risk_lambda * var_r
+        if self.diagnostic_no_risk_tax:
+            reward = float(net_return)
+        else:
+            reward = net_return - self.gamma * self.risk_lambda * var_r
 
         self.prev_w = w.copy()
         self.prev_date = date_t
@@ -614,6 +634,8 @@ class TradingEnvironment:
 
     def episode_utility_bonus(self):
         """Terminal utility bonus for one full episode (applied once in trainer)."""
+        if self.diagnostic_no_risk_tax:
+            return 0.0
         if len(self.return_history) < 2:
             return 0.0
         rh = np.asarray(self.return_history, dtype=np.float64)
@@ -756,7 +778,7 @@ class MPHDRLTrader(nn.Module):
         h = srl_module(flat)
         return h.reshape(B, P, -1)  # (batch, N_pairs, H)
 
-    def forward_step(self, windows, explore=True):
+    def forward_step(self, windows, explore=True, pair_mask=None):
         if isinstance(windows, torch.Tensor):
             windows_t = windows.to(device=self.device, dtype=torch.float32)
         else:
@@ -782,8 +804,16 @@ class MPHDRLTrader(nn.Module):
         probs = probs.reshape(B, P, -1)
         sl_actions = sl_actions.reshape(B, P)
 
-        w = self.portfolio(h_actor, probs, sl_actions, self.M,
-                           actions=actions, training=explore)
+        pm = None
+        if pair_mask is not None:
+            pm = torch.as_tensor(np.asarray(pair_mask), dtype=torch.float32, device=self.device)
+            if pm.dim() == 1:
+                pm = pm.unsqueeze(0)
+
+        w = self.portfolio(
+            h_actor, probs, sl_actions, self.M,
+            actions=actions, training=explore, pair_mask=pm,
+        )
 
         return {
             "actions": actions,
