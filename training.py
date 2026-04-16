@@ -1170,7 +1170,8 @@ class SRRLTrainer(BaseTrainer):
         Ba, Pa, Ha = h_a.shape
         mu_a = self.model.actor(h_a.reshape(Ba * Pa, Ha)).reshape(Ba, Pa)
         h_c_detach = self.model.encode_all_pairs(sw, self.model.srl_cls).detach()
-        p_rev_det = self.model.cls_head(h_c_detach.reshape(Ba * Pa, Hc)).reshape(Ba, Pa).detach()
+        Bcd, Pcd, Hcd = h_c_detach.shape
+        p_rev_det = self.model.cls_head(h_c_detach.reshape(Bcd * Pcd, Hcd)).reshape(Bcd, Pcd).detach()
         E_gated_actor = p_rev_det * mu_a
         if pmask is not None:
             E_gated_actor = E_gated_actor * pmask
