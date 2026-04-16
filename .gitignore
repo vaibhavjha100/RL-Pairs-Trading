@@ -5,6 +5,9 @@ eda/
 # Saved model checkpoints (per-agent subdirs, e.g. models/MPHDRL/)
 models/
 
+# Local experiment artifacts
+artifacts/
+
 # Office documents
 *.doc
 *.docx

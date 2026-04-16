@@ -28,6 +28,7 @@ import os
 import sys
 import time
 import argparse
+import random
 import pickle
 import numpy as np
 import pandas as pd
@@ -44,6 +45,64 @@ from MPHDRL import (
 )
 from benchmark import BENCHMARK_MODEL_DIR, BenchmarkDDPG
 from SRRL import SRRL_HPARAMS, SRRL_MODEL_DIR, SRRLTrader
+
+
+def set_global_seed(seed: int | None):
+    """Best-effort deterministic setup for reproducible tuning runs."""
+    if seed is None:
+        return
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+def apply_srrl_overrides(args):
+    """Apply SRRL-specific CLI overrides in-place to SRRL_HPARAMS."""
+    mapping = {
+        "srrl_lr": "lr",
+        "srrl_tau": "tau",
+        "srrl_batch_size": "batch_size",
+        "srrl_discount_gamma": "discount_gamma",
+        "srrl_n_step": "n_step",
+        "srrl_gamma_risk": "gamma_risk",
+        "srrl_risk_lambda": "risk_lambda",
+        "srrl_var_window": "var_window",
+        "srrl_terminal_utility_weight": "terminal_utility_weight",
+        "srrl_sigma_explore": "sigma_explore",
+        "srrl_sigma_explore_min": "sigma_explore_min",
+        "srrl_turnover_penalty": "turnover_penalty",
+    }
+    for arg_key, hp_key in mapping.items():
+        v = getattr(args, arg_key, None)
+        if v is not None:
+            SRRL_HPARAMS[hp_key] = v
+    if SRRL_HPARAMS["sigma_explore_min"] > SRRL_HPARAMS["sigma_explore"]:
+        SRRL_HPARAMS["sigma_explore_min"] = SRRL_HPARAMS["sigma_explore"]
+
+
+def print_srrl_hparams():
+    keys = [
+        "lr",
+        "tau",
+        "batch_size",
+        "discount_gamma",
+        "n_step",
+        "gamma_risk",
+        "risk_lambda",
+        "var_window",
+        "terminal_utility_weight",
+        "sigma_explore",
+        "sigma_explore_min",
+        "turnover_penalty",
+    ]
+    print("SRRL hyperparameters:")
+    for k in keys:
+        print(f"  {k}: {SRRL_HPARAMS[k]}")
 
 
 def resolve_training_device(preference: str) -> torch.device:
@@ -1318,11 +1377,26 @@ def parse_args():
             "terminal utility bonus off; txn and shorting costs unchanged (diagnostic runs)."
         ),
     )
+    parser.add_argument("--seed", type=int, default=None, help="Global random seed for reproducible runs.")
+    parser.add_argument("--srrl-lr", type=float, default=None, dest="srrl_lr")
+    parser.add_argument("--srrl-tau", type=float, default=None, dest="srrl_tau")
+    parser.add_argument("--srrl-batch-size", type=int, default=None, dest="srrl_batch_size")
+    parser.add_argument("--srrl-discount-gamma", type=float, default=None, dest="srrl_discount_gamma")
+    parser.add_argument("--srrl-n-step", type=int, default=None, dest="srrl_n_step")
+    parser.add_argument("--srrl-gamma-risk", type=float, default=None, dest="srrl_gamma_risk")
+    parser.add_argument("--srrl-risk-lambda", type=float, default=None, dest="srrl_risk_lambda")
+    parser.add_argument("--srrl-var-window", type=int, default=None, dest="srrl_var_window")
+    parser.add_argument("--srrl-terminal-utility-weight", type=float, default=None, dest="srrl_terminal_utility_weight")
+    parser.add_argument("--srrl-sigma-explore", type=float, default=None, dest="srrl_sigma_explore")
+    parser.add_argument("--srrl-sigma-explore-min", type=float, default=None, dest="srrl_sigma_explore_min")
+    parser.add_argument("--srrl-turnover-penalty", type=float, default=None, dest="srrl_turnover_penalty")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    set_global_seed(args.seed)
+    apply_srrl_overrides(args)
 
     resolved = resolve_training_device(args.device)
     configure_accelerator(resolved)
@@ -1338,7 +1412,11 @@ def main():
         )
     if getattr(args, "env_diagnostic_no_risk_tax", False):
         print("Env diagnostic: no variance penalty in reward, no taxes, no terminal bonus; costs on.")
+    if args.seed is not None:
+        print(f"Seed: {args.seed}")
     print("=" * 60)
+    if args.agent in ("SRRL", "Both"):
+        print_srrl_hparams()
 
     print("\nChecking data readiness...")
     ok, data = check_data_readiness()
