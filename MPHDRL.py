@@ -151,12 +151,21 @@ def check_data_readiness():
     else:
         print("\nDATA READINESS: FAIL")
 
-    return all_ok, {
+    data_dict = {
         "X_train": X, "y_train": y, "pairs": pairs,
         "hedge_ratios": loaded["hedge_ratios"],
         "sequence_meta": loaded["sequence_xy"],
         "M": M, "tickers": tickers, "ticker_to_idx": ticker_to_idx,
     }
+    bin32_path = os.path.join(base, "spread_y_bin32_train.pkl")
+    if os.path.isfile(bin32_path):
+        with open(bin32_path, "rb") as f:
+            data_dict["y_bin32_train"] = pickle.load(f)
+        print(f"  OK: spread_y_bin32_train ({bin32_path})")
+    else:
+        print(f"  INFO: spread_y_bin32_train not found (SRRL will not be available)")
+
+    return all_ok, data_dict
 
 
 # ============================================================================

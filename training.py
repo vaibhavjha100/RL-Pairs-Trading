@@ -40,6 +40,7 @@ from MPHDRL import (
     check_data_readiness,
 )
 from benchmark import BENCHMARK_MODEL_DIR, BenchmarkDDPG
+from SRRL import SRRL_HPARAMS, SRRL_MODEL_DIR, SRRLTrader
 
 
 def resolve_training_device(preference: str) -> torch.device:
@@ -899,6 +900,320 @@ class BenchmarkTrainer(BaseTrainer):
                 f"Epoch {epoch:4d}/{self.epochs} | {elapsed:5.1f}s | trans={n_trans} | "
                 f"{loss_str} | nan_batches={epoch_nan} skipped={epoch_skips}"
             )
+
+            if epoch % self.save_every == 0 or epoch == self.epochs:
+                self.save(tag=f"epoch_{epoch}")
+
+        self.save(tag="final")
+        print(f"\nTraining complete. Final model saved to {self.model_dir}")
+
+    def save(self, tag="checkpoint"):
+        path = os.path.join(self.model_dir, f"{tag}.pt")
+        self.model.save_checkpoint(path)
+
+
+# ============================================================================
+# SRRL (Supervised-RL Hybrid) Trainer
+# ============================================================================
+
+class SRRLUniformReplay:
+    """Simple ring buffer with uniform sampling for SRRL transitions."""
+
+    def __init__(self, capacity: int):
+        self.capacity = max(1, int(capacity))
+        self.buffer: list = []
+        self.pos = 0
+
+    def add(self, transition: dict) -> None:
+        if len(self.buffer) < self.capacity:
+            self.buffer.append(transition)
+        else:
+            self.buffer[self.pos] = transition
+        self.pos = (self.pos + 1) % self.capacity
+
+    def sample(self, batch_size: int) -> list:
+        n = len(self.buffer)
+        if n == 0:
+            raise ValueError("Replay is empty.")
+        replace = batch_size > n
+        idx = np.random.choice(n, size=batch_size, replace=replace)
+        return [self.buffer[i] for i in idx]
+
+    def __len__(self) -> int:
+        return len(self.buffer)
+
+
+@register_agent("SRRL")
+class SRRLTrainer(BaseTrainer):
+    """Supervised-RL Hybrid: classification gates DDPG actor for per-pair lever."""
+
+    def __init__(self, args, data):
+        super().__init__(args, data)
+        self.device = args.resolved_device
+        self.epochs = args.epochs
+        self.save_every = args.save_every
+        self.model_dir = SRRL_MODEL_DIR
+        os.makedirs(self.model_dir, exist_ok=True)
+
+        F_dim = data["X_train"].shape[2]
+        n_pairs = len(data["pairs"])
+        n_tickers = len(data["tickers"])
+        self.n_pairs = n_pairs
+
+        self.model = SRRLTrader(F_dim, n_pairs, n_tickers, data["M"], device=str(self.device))
+
+        if "y_bin32_train" not in data:
+            raise RuntimeError(
+                "SRRL requires binary labels. Run preprocessing.py first "
+                "(produces spread_y_bin32_train.pkl)."
+            )
+        self.y_bin32_train = data["y_bin32_train"]
+        base_rate = float(self.y_bin32_train.mean()) if len(self.y_bin32_train) > 0 else 0.5
+        self.cls_pos_weight = max((1.0 - base_rate) / max(base_rate, 1e-8), 1.0)
+        print(f"  SRRL cls pos_weight: {self.cls_pos_weight:.3f} (base_rate={base_rate:.4f})")
+
+        meta = data["sequence_meta"].copy()
+        if "Unnamed: 0" in meta.columns:
+            meta = meta.drop(columns=["Unnamed: 0"])
+        meta["target_date"] = pd.to_datetime(meta["target_date"])
+        train_meta = meta[meta["split"] == "train"].reset_index(drop=True)
+        pair_key_to_idx = {f"{a}|{b}": i for i, (a, b) in enumerate(data["pairs"])}
+        self._date_pair_label: dict = {}
+        for iloc_idx in range(len(train_meta)):
+            row = train_meta.iloc[iloc_idx]
+            d = row["target_date"]
+            pk = str(row["Pair"])
+            if pk in pair_key_to_idx:
+                p_idx = pair_key_to_idx[pk]
+                self._date_pair_label.setdefault(d, {})[p_idx] = int(self.y_bin32_train[iloc_idx])
+
+        _diag = getattr(args, "env_diagnostic_no_risk_tax", False)
+        self.env = TradingEnvironment(
+            pairs=data["pairs"],
+            tickers=data["tickers"],
+            ticker_to_idx=data["ticker_to_idx"],
+            trading_raw_path=os.path.join("data", "trading", "raw.csv"),
+            sequence_meta=data["sequence_meta"],
+            X_train=data["X_train"],
+            y_train=data["y_train"],
+            zeta=SRRL_HPARAMS.get("zeta", HPARAMS["zeta"]),
+            gamma=SRRL_HPARAMS["gamma_risk"],
+            risk_lambda=SRRL_HPARAMS["risk_lambda"],
+            var_window=SRRL_HPARAMS["var_window"],
+            terminal_utility_weight=0.0 if _diag else SRRL_HPARAMS["terminal_utility_weight"],
+            use_stop_loss=False,
+            diagnostic_no_risk_tax=_diag,
+        )
+        self.n_step = SRRL_HPARAMS["n_step"]
+
+        buffer_cap = max(10000, self.env.num_steps * 2)
+        self.replay = SRRLUniformReplay(buffer_cap)
+
+        lr = SRRL_HPARAMS["lr"]
+        self.opt_cls = torch.optim.Adam(
+            list(self.model.srl_cls.parameters()) + list(self.model.cls_head.parameters()),
+            lr=lr,
+        )
+        self.opt_actor = torch.optim.Adam(
+            list(self.model.srl_actor.parameters()) + list(self.model.actor.parameters()),
+            lr=lr,
+        )
+        self.opt_critic = torch.optim.Adam(
+            list(self.model.srl_critic.parameters()) + list(self.model.critic.parameters()),
+            lr=lr,
+        )
+
+    def _h2d(self, arr, dtype=torch.float32):
+        dev = self.model.device
+        if dev.type == "cuda":
+            return torch.as_tensor(np.asarray(arr), dtype=dtype).pin_memory().to(
+                dev, non_blocking=True
+            )
+        return torch.tensor(np.asarray(arr), dtype=dtype, device=dev)
+
+    def _get_bin32_labels(self, date):
+        """Per-pair binary labels for a given training date; 0 where unknown."""
+        labels = np.zeros(self.n_pairs, dtype=np.float32)
+        mapping = self._date_pair_label.get(date, {})
+        for p_idx, lbl in mapping.items():
+            labels[p_idx] = float(lbl)
+        return labels
+
+    def _collect_episode(self):
+        state_info = self.env.reset()
+        if state_info is None:
+            return 0
+        n = 0
+        n_step = self.n_step
+        discount = SRRL_HPARAMS["discount_gamma"]
+        nstep_buf: list[dict] = []
+
+        def _flush(extra_bonus=0.0):
+            nonlocal n
+            if not nstep_buf:
+                return
+            G = 0.0
+            for k in range(len(nstep_buf) - 1, -1, -1):
+                G = nstep_buf[k]["reward"] + discount * G
+            G += float(extra_bonus)
+            head = nstep_buf[0]
+            tail = nstep_buf[-1]
+            self.replay.add({
+                "state_windows": head["state_windows"],
+                "E_gated": head["E_gated"],
+                "y_bin32": head["y_bin32"],
+                "pair_mask": head["pair_mask"],
+                "reward": np.float32(G),
+                "next_state_windows": tail["next_state_windows"],
+                "done": np.float32(1.0 if tail["done"] else 0.0),
+                "n_step": len(nstep_buf),
+            })
+            n += 1
+
+        while True:
+            windows, mask, y_spread = state_info
+            date_t = self.env.unique_dates[self.env.t]
+            bin32 = self._get_bin32_labels(date_t)
+
+            with torch.no_grad():
+                step_out = self.model.forward_step(windows, explore=True, pair_mask=mask)
+
+            w_np = step_out["weights"].detach().cpu().numpy().reshape(-1)
+            E_gated_np = step_out["pair_exposures"].detach().cpu().numpy().reshape(self.n_pairs)
+
+            next_info, reward, done = self.env.step(w_np, sl_actions=None, spread_values=None)
+            if next_info is not None:
+                next_windows, _, _ = next_info
+            else:
+                next_windows = np.zeros_like(windows)
+
+            nstep_buf.append({
+                "state_windows": windows.astype(np.float32),
+                "E_gated": E_gated_np.astype(np.float32),
+                "y_bin32": bin32.astype(np.float32),
+                "pair_mask": mask.astype(np.float32),
+                "reward": float(reward),
+                "next_state_windows": next_windows.astype(np.float32),
+                "done": bool(done),
+            })
+
+            if len(nstep_buf) >= n_step:
+                _flush()
+                nstep_buf.pop(0)
+
+            if done:
+                terminal_bonus = float(self.env.episode_utility_bonus())
+                n_tail = max(len(nstep_buf), 1)
+                bonus_share = terminal_bonus / n_tail
+                while nstep_buf:
+                    _flush(extra_bonus=bonus_share)
+                    nstep_buf.pop(0)
+                break
+            state_info = next_info
+        return n
+
+    def _update_step(self):
+        B = SRRL_HPARAMS["batch_size"]
+        gamma = SRRL_HPARAMS["discount_gamma"]
+        if len(self.replay) < B:
+            return {}
+
+        batch = self.replay.sample(B)
+
+        sw = self._h2d(np.stack([t["state_windows"] for t in batch]))
+        E_g = self._h2d(np.stack([t["E_gated"] for t in batch]))
+        rews = self._h2d(np.array([t["reward"] for t in batch]))
+        nsw = self._h2d(np.stack([t["next_state_windows"] for t in batch]))
+        dones = self._h2d(np.array([t["done"] for t in batch]))
+        ns = self._h2d(np.array([t.get("n_step", 1) for t in batch]))
+        y_cls = self._h2d(np.stack([t["y_bin32"] for t in batch]))
+        pmask = self._h2d(np.stack([t["pair_mask"] for t in batch]))
+
+        # --- Classification loss (weighted BCE) ---
+        h_cls = self.model.encode_all_pairs(sw, self.model.srl_cls)
+        Bc, Pc, Hc = h_cls.shape
+        p_pred = self.model.cls_head(h_cls.reshape(Bc * Pc, Hc)).reshape(Bc, Pc)
+        pos_w = torch.tensor(self.cls_pos_weight, device=sw.device, dtype=sw.dtype)
+        weight_per = pmask * (y_cls * pos_w + (1.0 - y_cls) * 1.0)
+        bce = F.binary_cross_entropy(p_pred, y_cls, weight=weight_per)
+        self.opt_cls.zero_grad()
+        bce.backward()
+        torch.nn.utils.clip_grad_norm_(
+            list(self.model.srl_cls.parameters()) + list(self.model.cls_head.parameters()), 1.0
+        )
+        self.opt_cls.step()
+
+        # --- Critic loss (DDPG-style, n-step) ---
+        with torch.no_grad():
+            mu_next = self.model.actor_mean_target(nsw)
+            q_next = self.model.critic_q_target(nsw, mu_next)
+            gamma_n = gamma ** ns
+            y_q = rews + (1.0 - dones) * gamma_n * q_next
+            y_q = torch.nan_to_num(y_q, nan=0.0)
+
+        q = self.model.critic_q(sw, E_g, self.model.srl_critic, self.model.critic)
+        loss_c = F.mse_loss(q, y_q)
+        self.opt_critic.zero_grad()
+        loss_c.backward()
+        torch.nn.utils.clip_grad_norm_(
+            list(self.model.srl_critic.parameters()) + list(self.model.critic.parameters()), 1.0
+        )
+        self.opt_critic.step()
+
+        # --- Actor loss: -Q(s, E_gated) ---
+        for p in self.model.srl_critic.parameters():
+            p.requires_grad = False
+        for p in self.model.critic.parameters():
+            p.requires_grad = False
+
+        h_a = self.model.encode_all_pairs(sw, self.model.srl_actor)
+        Ba, Pa, Ha = h_a.shape
+        mu_a = self.model.actor(h_a.reshape(Ba * Pa, Ha)).reshape(Ba, Pa)
+        h_c_detach = self.model.encode_all_pairs(sw, self.model.srl_cls).detach()
+        p_rev_det = self.model.cls_head(h_c_detach.reshape(Ba * Pa, Hc)).reshape(Ba, Pa).detach()
+        E_gated_actor = p_rev_det * mu_a
+        if pmask is not None:
+            E_gated_actor = E_gated_actor * pmask
+        q_a = self.model.critic_q(sw, E_gated_actor, self.model.srl_critic, self.model.critic)
+        loss_a = -q_a.mean()
+
+        self.opt_actor.zero_grad()
+        loss_a.backward()
+        torch.nn.utils.clip_grad_norm_(
+            list(self.model.srl_actor.parameters()) + list(self.model.actor.parameters()), 1.0
+        )
+        self.opt_actor.step()
+
+        for p in self.model.srl_critic.parameters():
+            p.requires_grad = True
+        for p in self.model.critic.parameters():
+            p.requires_grad = True
+
+        self.model.soft_update()
+
+        return {"bce": bce.item(), "critic": loss_c.item(), "actor": loss_a.item()}
+
+    def train(self):
+        print(f"\n{'=' * 60}")
+        print(f"Training SRRL agent for {self.epochs} epochs")
+        print(f"Device: {self.device} ({self.device.type}) | Pairs: {self.n_pairs}")
+        print(f"{'=' * 60}\n")
+
+        for epoch in range(1, self.epochs + 1):
+            t0 = time.time()
+            n_trans = self._collect_episode()
+
+            epoch_losses = {}
+            n_updates = min(n_trans, self.env.num_steps)
+            for _ in range(n_updates):
+                step_losses = self._update_step()
+                for k, v in step_losses.items():
+                    epoch_losses.setdefault(k, []).append(v)
+
+            elapsed = time.time() - t0
+            avg = {k: np.mean(v) for k, v in epoch_losses.items()}
+            loss_str = "  ".join(f"{k}={v:.4f}" for k, v in avg.items()) if avg else "(no updates)"
+            print(f"Epoch {epoch:4d}/{self.epochs} | {elapsed:5.1f}s | trans={n_trans} | {loss_str}")
 
             if epoch % self.save_every == 0 or epoch == self.epochs:
                 self.save(tag=f"epoch_{epoch}")
