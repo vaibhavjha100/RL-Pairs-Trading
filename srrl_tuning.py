@@ -75,6 +75,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prune-churn", type=float, default=0.20)
     parser.add_argument("--outdir", type=str, default="artifacts/srrl_tuning")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--srrl-cls-warmup-epochs",
+        type=int,
+        default=0,
+        dest="srrl_cls_warmup_epochs",
+        help="Forwarded to training.py: supervised cls warm-up epochs before joint SRRL updates.",
+    )
     return parser.parse_args()
 
 
@@ -204,6 +211,7 @@ def run_trial(
     seed: int,
     epochs: int,
     prune_churn: float,
+    cls_warmup_epochs: int = 0,
 ) -> TrialResult:
     trial_id = stable_id(stage, params, seed)
     log_path = paths["logs"] / f"{stage}_{trial_id}.log"
@@ -243,6 +251,8 @@ def run_trial(
         train_cmd += ["--srrl-gamma-risk", str(params["gamma_risk"])]
     if "risk_lambda" in params:
         train_cmd += ["--srrl-risk-lambda", str(params["risk_lambda"])]
+    if cls_warmup_epochs > 0:
+        train_cmd += ["--srrl-cls-warmup-epochs", str(int(cls_warmup_epochs))]
 
     train_proc = run_cmd(train_cmd, root)
     log_path.write_text(train_proc.stdout + "\n\nSTDERR:\n" + train_proc.stderr, encoding="utf-8")
@@ -424,6 +434,7 @@ def main():
             seed=seed,
             epochs=epochs,
             prune_churn=args.prune_churn,
+            cls_warmup_epochs=args.srrl_cls_warmup_epochs,
         )
         append_trial(trials_csv, result)
         seen_ids.add(tid)

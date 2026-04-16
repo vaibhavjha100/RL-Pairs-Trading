@@ -38,6 +38,7 @@ SRRL_HPARAMS = {
     "sigma_explore": 0.3,
     "sigma_explore_min": 0.10,
     "turnover_penalty": 0.05,
+    "cls_warmup_epochs": 0,
 }
 
 SRRL_MODEL_DIR = os.path.join("models", "srrl")

@@ -76,6 +76,7 @@ def apply_srrl_overrides(args):
         "srrl_sigma_explore": "sigma_explore",
         "srrl_sigma_explore_min": "sigma_explore_min",
         "srrl_turnover_penalty": "turnover_penalty",
+        "srrl_cls_warmup_epochs": "cls_warmup_epochs",
     }
     for arg_key, hp_key in mapping.items():
         v = getattr(args, arg_key, None)
@@ -99,6 +100,7 @@ def print_srrl_hparams():
         "sigma_explore",
         "sigma_explore_min",
         "turnover_penalty",
+        "cls_warmup_epochs",
     ]
     print("SRRL hyperparameters:")
     for k in keys:
@@ -1063,6 +1065,7 @@ class SRRLTrainer(BaseTrainer):
             diagnostic_no_risk_tax=_diag,
         )
         self.n_step = SRRL_HPARAMS["n_step"]
+        self.cls_warmup_epochs = max(0, int(SRRL_HPARAMS.get("cls_warmup_epochs", 0)))
         self._episode_diag = {}
 
         buffer_cap = max(10000, self.env.num_steps * 2)
@@ -1203,7 +1206,7 @@ class SRRLTrainer(BaseTrainer):
         }
         return n
 
-    def _update_step(self):
+    def _update_step(self, epoch: int):
         B = SRRL_HPARAMS["batch_size"]
         gamma = SRRL_HPARAMS["discount_gamma"]
         if len(self.replay) < B:
@@ -1234,6 +1237,9 @@ class SRRLTrainer(BaseTrainer):
             list(self.model.srl_cls.parameters()) + list(self.model.cls_head.parameters()), 1.0
         )
         self.opt_cls.step()
+
+        if epoch <= self.cls_warmup_epochs:
+            return {"bce": bce.item()}
 
         # --- Critic loss (DDPG-style, n-step) ---
         with torch.no_grad():
@@ -1305,6 +1311,11 @@ class SRRLTrainer(BaseTrainer):
         print(f"\n{'=' * 60}")
         print(f"Training SRRL agent for {self.epochs} epochs")
         print(f"Device: {self.device} ({self.device.type}) | Pairs: {self.n_pairs}")
+        if self.cls_warmup_epochs > 0:
+            print(
+                f"cls_warmup_epochs={self.cls_warmup_epochs} "
+                f"(supervised BCE only for srl_cls + cls_head, then joint training)"
+            )
         print(f"{'=' * 60}\n")
 
         for epoch in range(1, self.epochs + 1):
@@ -1314,7 +1325,7 @@ class SRRLTrainer(BaseTrainer):
             epoch_losses = {}
             n_updates = min(n_trans, self.env.num_steps)
             for _ in range(n_updates):
-                step_losses = self._update_step()
+                step_losses = self._update_step(epoch)
                 for k, v in step_losses.items():
                     epoch_losses.setdefault(k, []).append(v)
 
@@ -1328,13 +1339,19 @@ class SRRLTrainer(BaseTrainer):
                 f"churn={diag.get('churn_proxy', float('nan')):.4f}  "
                 f"p_rev={diag.get('mean_p_revert', float('nan')):.4f}"
             )
+            phase = "cls_warmup" if epoch <= self.cls_warmup_epochs else "joint"
             print(
                 f"Epoch {epoch:4d}/{self.epochs} | {elapsed:5.1f}s | "
-                f"trans={n_trans} | {loss_str} | {diag_str}"
+                f"{phase:10s} | trans={n_trans} | {loss_str} | {diag_str}"
             )
 
             if epoch % self.save_every == 0 or epoch == self.epochs:
                 self.save(tag=f"epoch_{epoch}")
+
+            if self.cls_warmup_epochs > 0 and epoch == self.cls_warmup_epochs:
+                print(
+                    "\nSwitching to joint SRRL training (critic + actor + target soft updates).\n"
+                )
 
         self.save(tag="final")
         print(f"\nTraining complete. Final model saved to {self.model_dir}")
@@ -1390,6 +1407,13 @@ def parse_args():
     parser.add_argument("--srrl-sigma-explore", type=float, default=None, dest="srrl_sigma_explore")
     parser.add_argument("--srrl-sigma-explore-min", type=float, default=None, dest="srrl_sigma_explore_min")
     parser.add_argument("--srrl-turnover-penalty", type=float, default=None, dest="srrl_turnover_penalty")
+    parser.add_argument(
+        "--srrl-cls-warmup-epochs",
+        type=int,
+        default=None,
+        dest="srrl_cls_warmup_epochs",
+        help="SRRL: train only srl_cls + cls_head (BCE) for first N epochs, then joint RL (default: 0).",
+    )
     return parser.parse_args()
 
 
