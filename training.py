@@ -1004,6 +1004,7 @@ class SRRLTrainer(BaseTrainer):
             diagnostic_no_risk_tax=_diag,
         )
         self.n_step = SRRL_HPARAMS["n_step"]
+        self._episode_diag = {}
 
         buffer_cap = max(10000, self.env.num_steps * 2)
         self.replay = SRRLUniformReplay(buffer_cap)
@@ -1038,7 +1039,15 @@ class SRRLTrainer(BaseTrainer):
             labels[p_idx] = float(lbl)
         return labels
 
-    def _collect_episode(self):
+    def _explore_sigma(self, epoch: int) -> float:
+        sigma_hi = float(SRRL_HPARAMS.get("sigma_explore", 0.3))
+        sigma_lo = float(SRRL_HPARAMS.get("sigma_explore_min", sigma_hi))
+        if self.epochs <= 1:
+            return sigma_lo
+        frac = float(max(0, epoch - 1)) / float(max(1, self.epochs - 1))
+        return sigma_hi + (sigma_lo - sigma_hi) * frac
+
+    def _collect_episode(self, epoch: int):
         state_info = self.env.reset()
         if state_info is None:
             return 0
@@ -1046,6 +1055,13 @@ class SRRLTrainer(BaseTrainer):
         n_step = self.n_step
         discount = SRRL_HPARAMS["discount_gamma"]
         nstep_buf: list[dict] = []
+        sigma_now = self._explore_sigma(epoch)
+        exposure_abs_sum = 0.0
+        p_revert_sum = 0.0
+        n_steps = 0
+        churn_sum = 0.0
+        churn_count = 0
+        prev_e_gated = None
 
         def _flush(extra_bonus=0.0):
             nonlocal n
@@ -1062,6 +1078,7 @@ class SRRLTrainer(BaseTrainer):
                 "E_gated": head["E_gated"],
                 "y_bin32": head["y_bin32"],
                 "pair_mask": head["pair_mask"],
+                "next_pair_mask": tail["next_pair_mask"],
                 "reward": np.float32(G),
                 "next_state_windows": tail["next_state_windows"],
                 "done": np.float32(1.0 if tail["done"] else 0.0),
@@ -1075,22 +1092,34 @@ class SRRLTrainer(BaseTrainer):
             bin32 = self._get_bin32_labels(date_t)
 
             with torch.no_grad():
-                step_out = self.model.forward_step(windows, explore=True, pair_mask=mask)
+                step_out = self.model.forward_step(
+                    windows, explore=True, pair_mask=mask, explore_sigma=sigma_now
+                )
 
             w_np = step_out["weights"].detach().cpu().numpy().reshape(-1)
             E_gated_np = step_out["pair_exposures"].detach().cpu().numpy().reshape(self.n_pairs)
+            p_revert_np = step_out["p_revert"].detach().cpu().numpy().reshape(self.n_pairs)
+            exposure_abs_sum += float(np.mean(np.abs(E_gated_np)))
+            p_revert_sum += float(np.mean(p_revert_np))
+            if prev_e_gated is not None:
+                churn_sum += float(np.mean(np.abs(E_gated_np - prev_e_gated)))
+                churn_count += 1
+            prev_e_gated = E_gated_np.copy()
+            n_steps += 1
 
             next_info, reward, done = self.env.step(w_np, sl_actions=None, spread_values=None)
             if next_info is not None:
-                next_windows, _, _ = next_info
+                next_windows, next_mask, _ = next_info
             else:
                 next_windows = np.zeros_like(windows)
+                next_mask = np.zeros_like(mask)
 
             nstep_buf.append({
                 "state_windows": windows.astype(np.float32),
                 "E_gated": E_gated_np.astype(np.float32),
                 "y_bin32": bin32.astype(np.float32),
                 "pair_mask": mask.astype(np.float32),
+                "next_pair_mask": next_mask.astype(np.float32),
                 "reward": float(reward),
                 "next_state_windows": next_windows.astype(np.float32),
                 "done": bool(done),
@@ -1107,6 +1136,12 @@ class SRRLTrainer(BaseTrainer):
                     nstep_buf.pop(0)
                 break
             state_info = next_info
+        self._episode_diag = {
+            "sigma": sigma_now,
+            "mean_abs_Eg": (exposure_abs_sum / max(n_steps, 1)),
+            "churn_proxy": (churn_sum / max(churn_count, 1)),
+            "mean_p_revert": (p_revert_sum / max(n_steps, 1)),
+        }
         return n
 
     def _update_step(self):
@@ -1125,6 +1160,7 @@ class SRRLTrainer(BaseTrainer):
         ns = self._h2d(np.array([t.get("n_step", 1) for t in batch]))
         y_cls = self._h2d(np.stack([t["y_bin32"] for t in batch]))
         pmask = self._h2d(np.stack([t["pair_mask"] for t in batch]))
+        npmask = self._h2d(np.stack([t["next_pair_mask"] for t in batch]))
 
         # --- Classification loss (weighted BCE) ---
         h_cls = self.model.encode_all_pairs(sw, self.model.srl_cls)
@@ -1143,7 +1179,12 @@ class SRRLTrainer(BaseTrainer):
         # --- Critic loss (DDPG-style, n-step) ---
         with torch.no_grad():
             mu_next = self.model.actor_mean_target(nsw)
-            q_next = self.model.critic_q_target(nsw, mu_next)
+            h_cls_next = self.model.encode_all_pairs(nsw, self.model.srl_cls)
+            Bn, Pn, Hn = h_cls_next.shape
+            p_next = self.model.cls_head(h_cls_next.reshape(Bn * Pn, Hn)).reshape(Bn, Pn)
+            E_gated_next = p_next * mu_next
+            E_gated_next = E_gated_next * npmask
+            q_next = self.model.critic_q_target(nsw, E_gated_next)
             gamma_n = gamma ** ns
             y_q = rews + (1.0 - dones) * gamma_n * q_next
             y_q = torch.nan_to_num(y_q, nan=0.0)
@@ -1173,7 +1214,12 @@ class SRRLTrainer(BaseTrainer):
         if pmask is not None:
             E_gated_actor = E_gated_actor * pmask
         q_a = self.model.critic_q(sw, E_gated_actor, self.model.srl_critic, self.model.critic)
-        loss_a = -q_a.mean()
+        turnover_lambda = float(SRRL_HPARAMS.get("turnover_penalty", 0.0))
+        if turnover_lambda > 0.0:
+            turn_pen = (pmask * (E_gated_actor - E_g).abs()).sum() / pmask.sum().clamp_min(1.0)
+        else:
+            turn_pen = q_a.new_tensor(0.0)
+        loss_a = -q_a.mean() + turnover_lambda * turn_pen
 
         self.opt_actor.zero_grad()
         loss_a.backward()
@@ -1189,7 +1235,12 @@ class SRRLTrainer(BaseTrainer):
 
         self.model.soft_update()
 
-        return {"bce": bce.item(), "critic": loss_c.item(), "actor": loss_a.item()}
+        return {
+            "bce": bce.item(),
+            "critic": loss_c.item(),
+            "actor": loss_a.item(),
+            "turn_pen": float(turn_pen.item()),
+        }
 
     def train(self):
         print(f"\n{'=' * 60}")
@@ -1199,7 +1250,7 @@ class SRRLTrainer(BaseTrainer):
 
         for epoch in range(1, self.epochs + 1):
             t0 = time.time()
-            n_trans = self._collect_episode()
+            n_trans = self._collect_episode(epoch)
 
             epoch_losses = {}
             n_updates = min(n_trans, self.env.num_steps)
@@ -1211,7 +1262,17 @@ class SRRLTrainer(BaseTrainer):
             elapsed = time.time() - t0
             avg = {k: np.mean(v) for k, v in epoch_losses.items()}
             loss_str = "  ".join(f"{k}={v:.4f}" for k, v in avg.items()) if avg else "(no updates)"
-            print(f"Epoch {epoch:4d}/{self.epochs} | {elapsed:5.1f}s | trans={n_trans} | {loss_str}")
+            diag = self._episode_diag if isinstance(self._episode_diag, dict) else {}
+            diag_str = (
+                f"sigma={diag.get('sigma', float('nan')):.3f}  "
+                f"|E|={diag.get('mean_abs_Eg', float('nan')):.4f}  "
+                f"churn={diag.get('churn_proxy', float('nan')):.4f}  "
+                f"p_rev={diag.get('mean_p_revert', float('nan')):.4f}"
+            )
+            print(
+                f"Epoch {epoch:4d}/{self.epochs} | {elapsed:5.1f}s | "
+                f"trans={n_trans} | {loss_str} | {diag_str}"
+            )
 
             if epoch % self.save_every == 0 or epoch == self.epochs:
                 self.save(tag=f"epoch_{epoch}")

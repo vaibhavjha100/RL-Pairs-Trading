@@ -36,6 +36,8 @@ SRRL_HPARAMS = {
     "var_window": 60,
     "terminal_utility_weight": 1.0,
     "sigma_explore": 0.3,
+    "sigma_explore_min": 0.10,
+    "turnover_penalty": 0.05,
 }
 
 SRRL_MODEL_DIR = os.path.join("models", "srrl")
@@ -195,7 +197,7 @@ class SRRLTrader(nn.Module):
         h = srl_module(flat)
         return h.reshape(B, P, -1)
 
-    def forward_step(self, windows, explore=True, pair_mask=None):
+    def forward_step(self, windows, explore=True, pair_mask=None, explore_sigma=None):
         if isinstance(windows, torch.Tensor):
             wt = windows.to(device=self._device, dtype=torch.float32)
         else:
@@ -211,7 +213,12 @@ class SRRLTrader(nn.Module):
         mu_E = self.actor(h_actor.reshape(B * P, H)).reshape(B, P)
 
         if explore:
-            noise = torch.randn_like(mu_E) * SRRL_HPARAMS["sigma_explore"]
+            sigma = (
+                SRRL_HPARAMS["sigma_explore"]
+                if explore_sigma is None
+                else float(explore_sigma)
+            )
+            noise = torch.randn_like(mu_E) * sigma
             E = (mu_E + noise).clamp(-1.0, 1.0)
         else:
             E = mu_E
