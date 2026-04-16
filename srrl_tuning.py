@@ -26,6 +26,7 @@ from typing import Dict, List
 
 import numpy as np
 import pandas as pd
+import torch
 
 
 EPOCH_RE = re.compile(
@@ -150,6 +151,17 @@ def parse_last_epoch_metrics(train_output: str) -> Dict[str, float]:
 
 def run_cmd(cmd: List[str], cwd: Path) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, cwd=str(cwd), text=True, capture_output=True)
+
+
+def resolve_device(preference: str) -> str:
+    name = (preference or "auto").strip().lower()
+    if name == "auto":
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+    return name
 
 
 def compute_utility_from_srrl_csv(csv_path: Path, gamma: float = 0.5) -> Dict[str, float]:
@@ -389,9 +401,14 @@ def main():
     trials_csv = paths["base"] / "trials.csv"
     summary_json = paths["base"] / "summary.json"
     rng = random.Random(args.base_seed)
+    device = resolve_device(args.device)
 
     existing = load_trials_csv(trials_csv) if args.resume else pd.DataFrame()
-    seen_ids = set(existing["trial_id"].tolist()) if not existing.empty else set()
+    if not existing.empty and "status" in existing.columns:
+        resumable_statuses = {"ok", "pruned"}
+        seen_ids = set(existing.loc[existing["status"].isin(resumable_statuses), "trial_id"].tolist())
+    else:
+        seen_ids = set()
 
     def maybe_run(stage: str, params: Dict[str, float], seed: int, epochs: int):
         tid = stable_id(stage, params, seed)
@@ -401,7 +418,7 @@ def main():
             root=root,
             paths=paths,
             pybin=args.python_bin,
-            device=args.device,
+            device=device,
             stage=stage,
             params=params,
             seed=seed,
