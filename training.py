@@ -1,11 +1,13 @@
 """
 training.py -- Agent-agnostic training harness for RL pairs trading.
 
-Supports multiple RL agent types via a registry pattern: MPHDRL (hybrid HDRL)
-and Benchmark (plain GRU actor–critic, DDPG-style replay on pair exposures E).
-
-Training logic follows multi_pair_hdrl_trader_architecture.md (TD3 critics,
-DDQN stop-loss head, delayed actor + portfolio + auxiliary regression, PER).
+Supports multiple RL agent types via a registry pattern:
+    - MPHDRL: hybrid HDRL (TD3 critics, DDQN stop-loss, delayed actor + portfolio
+      + auxiliary regression, PER). See multi_pair_hdrl_trader_architecture.md.
+    - Benchmark: plain GRU actor–critic, DDPG-style replay on pair exposures E.
+    - SRRL: Supervised–RL hybrid — shared SRL encoders, per-pair mean-reversion
+      classifier (weighted BCE on y_bin32) gating a DDPG actor–critic; uniform
+      replay; no stop-loss head (uses spread_y_bin32_train.pkl labels).
 
 Usage:
     python training.py --agent Both --epochs 100
@@ -13,6 +15,7 @@ Usage:
     python training.py --agent MPHDRL --epochs 50 --device cuda
     python training.py --agent MPHDRL --epochs 50 --device auto
     python training.py --agent Benchmark --epochs 100 --device cuda
+    python training.py --agent SRRL --epochs 100
     python training.py --env-diagnostic-no-risk-tax  # diagnostic: no variance/tax/terminal bonus; costs on
 
 On CUDA (default): cudnn benchmark, TF32, fast H2D copies, mixed precision (bfloat16
@@ -1226,10 +1229,15 @@ class SRRLTrainer(BaseTrainer):
 # ============================================================================
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="RL Pairs Trading -- Training Harness")
+    parser = argparse.ArgumentParser(
+        description=(
+            "RL Pairs Trading -- Training harness for MPHDRL, Benchmark (DDPG), "
+            "and SRRL (supervised–RL hybrid with binary reversion labels)."
+        )
+    )
     parser.add_argument("--agent", type=str, default="Both",
                         choices=list(AGENT_REGISTRY.keys()) + ["Both"],
-                        help="Agent type to train: MPHDRL, Benchmark, or Both (default: Both)")
+                        help="Agent: MPHDRL, Benchmark, SRRL, or Both = MPHDRL then Benchmark (default: Both)")
     parser.add_argument("--epochs", type=int, default=100,
                         help="Number of training epochs (default: 100)")
     parser.add_argument("--device", type=str, default="auto",
