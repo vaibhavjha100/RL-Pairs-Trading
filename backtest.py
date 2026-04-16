@@ -422,7 +422,7 @@ def print_zero_weight_diagnostics(label, weights_by_date):
 
 def parse_args():
     p = argparse.ArgumentParser(description="Walk-forward backtest for RL Pairs Trading")
-    p.add_argument("--device", type=str, default="cpu", help="torch device (default: cpu)")
+    p.add_argument("--device", type=str, default="cpu", help="torch device: cpu, cuda, mps, or auto (default: cpu)")
     p.add_argument(
         "--mphdrl-checkpoint", type=str, default=None, dest="mphdrl_ckpt",
         help="MPHDRL .pt checkpoint (default: models/MPHDRL/final.pt or checkpoint.pt)",
@@ -447,10 +447,21 @@ def parse_args():
     return p.parse_args()
 
 
+def resolve_backtest_device(preference: str) -> torch.device:
+    name = (preference or "cpu").strip().lower()
+    if name == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    return torch.device(name)
+
+
 def main():
     args = parse_args()
     os.makedirs(BACKTEST_DIR, exist_ok=True)
-    dev = torch.device(args.device)
+    dev = resolve_backtest_device(args.device)
 
     print("=" * 60)
     print("Walk-Forward Backtest")
