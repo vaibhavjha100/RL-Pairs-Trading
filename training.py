@@ -1066,6 +1066,7 @@ class SRRLTrainer(BaseTrainer):
         )
         self.n_step = SRRL_HPARAMS["n_step"]
         self.cls_warmup_epochs = max(0, int(SRRL_HPARAMS.get("cls_warmup_epochs", 0)))
+        self._cls_frozen_for_rl = False
         self._episode_diag = {}
 
         buffer_cap = max(10000, self.env.num_steps * 2)
@@ -1206,6 +1207,12 @@ class SRRLTrainer(BaseTrainer):
         }
         return n
 
+    def _set_cls_trainable(self, trainable: bool):
+        for p in self.model.srl_cls.parameters():
+            p.requires_grad = trainable
+        for p in self.model.cls_head.parameters():
+            p.requires_grad = trainable
+
     def _update_step(self, epoch: int):
         B = SRRL_HPARAMS["batch_size"]
         gamma = SRRL_HPARAMS["discount_gamma"]
@@ -1220,27 +1227,27 @@ class SRRLTrainer(BaseTrainer):
         nsw = self._h2d(np.stack([t["next_state_windows"] for t in batch]))
         dones = self._h2d(np.array([t["done"] for t in batch]))
         ns = self._h2d(np.array([t.get("n_step", 1) for t in batch]))
-        y_cls = self._h2d(np.stack([t["y_bin32"] for t in batch]))
         pmask = self._h2d(np.stack([t["pair_mask"] for t in batch]))
         npmask = self._h2d(np.stack([t["next_pair_mask"] for t in batch]))
 
-        # --- Classification loss (weighted BCE) ---
-        h_cls = self.model.encode_all_pairs(sw, self.model.srl_cls)
-        Bc, Pc, Hc = h_cls.shape
-        p_pred = self.model.cls_head(h_cls.reshape(Bc * Pc, Hc)).reshape(Bc, Pc)
-        pos_w = torch.tensor(self.cls_pos_weight, device=sw.device, dtype=sw.dtype)
-        weight_per = pmask * (y_cls * pos_w + (1.0 - y_cls) * 1.0)
-        bce = F.binary_cross_entropy(p_pred, y_cls, weight=weight_per)
-        self.opt_cls.zero_grad()
-        bce.backward()
-        torch.nn.utils.clip_grad_norm_(
-            list(self.model.srl_cls.parameters()) + list(self.model.cls_head.parameters()), 1.0
-        )
-        self.opt_cls.step()
-
         if epoch <= self.cls_warmup_epochs:
+            y_cls = self._h2d(np.stack([t["y_bin32"] for t in batch]))
+            # --- Phase 1: classification-only warm-up (no RL updates) ---
+            h_cls = self.model.encode_all_pairs(sw, self.model.srl_cls)
+            Bc, Pc, Hc = h_cls.shape
+            p_pred = self.model.cls_head(h_cls.reshape(Bc * Pc, Hc)).reshape(Bc, Pc)
+            pos_w = torch.tensor(self.cls_pos_weight, device=sw.device, dtype=sw.dtype)
+            weight_per = pmask * (y_cls * pos_w + (1.0 - y_cls) * 1.0)
+            bce = F.binary_cross_entropy(p_pred, y_cls, weight=weight_per)
+            self.opt_cls.zero_grad()
+            bce.backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(self.model.srl_cls.parameters()) + list(self.model.cls_head.parameters()), 1.0
+            )
+            self.opt_cls.step()
             return {"bce": bce.item()}
 
+        # --- Phase 2: RL-only updates (classification frozen) ---
         # --- Critic loss (DDPG-style, n-step) ---
         with torch.no_grad():
             mu_next = self.model.actor_mean_target(nsw)
@@ -1300,12 +1307,7 @@ class SRRLTrainer(BaseTrainer):
 
         self.model.soft_update()
 
-        return {
-            "bce": bce.item(),
-            "critic": loss_c.item(),
-            "actor": loss_a.item(),
-            "turn_pen": float(turn_pen.item()),
-        }
+        return {"critic": loss_c.item(), "actor": loss_a.item(), "turn_pen": float(turn_pen.item())}
 
     def train(self):
         print(f"\n{'=' * 60}")
@@ -1314,11 +1316,23 @@ class SRRLTrainer(BaseTrainer):
         if self.cls_warmup_epochs > 0:
             print(
                 f"cls_warmup_epochs={self.cls_warmup_epochs} "
-                f"(supervised BCE only for srl_cls + cls_head, then joint training)"
+                f"(classification-only, then RL-only training)"
             )
         print(f"{'=' * 60}\n")
 
         for epoch in range(1, self.epochs + 1):
+            if (
+                self.cls_warmup_epochs > 0
+                and epoch == self.cls_warmup_epochs + 1
+                and not self._cls_frozen_for_rl
+            ):
+                self._set_cls_trainable(False)
+                self._cls_frozen_for_rl = True
+                print(
+                    "\nClassification pretraining complete. "
+                    "Switching to RL-only SRRL training (critic + actor + target soft updates).\n"
+                )
+
             t0 = time.time()
             n_trans = self._collect_episode(epoch)
 
@@ -1339,7 +1353,7 @@ class SRRLTrainer(BaseTrainer):
                 f"churn={diag.get('churn_proxy', float('nan')):.4f}  "
                 f"p_rev={diag.get('mean_p_revert', float('nan')):.4f}"
             )
-            phase = "cls_warmup" if epoch <= self.cls_warmup_epochs else "joint"
+            phase = "cls_only" if epoch <= self.cls_warmup_epochs else "rl_only"
             print(
                 f"Epoch {epoch:4d}/{self.epochs} | {elapsed:5.1f}s | "
                 f"{phase:10s} | trans={n_trans} | {loss_str} | {diag_str}"
@@ -1347,11 +1361,6 @@ class SRRLTrainer(BaseTrainer):
 
             if epoch % self.save_every == 0 or epoch == self.epochs:
                 self.save(tag=f"epoch_{epoch}")
-
-            if self.cls_warmup_epochs > 0 and epoch == self.cls_warmup_epochs:
-                print(
-                    "\nSwitching to joint SRRL training (critic + actor + target soft updates).\n"
-                )
 
         self.save(tag="final")
         print(f"\nTraining complete. Final model saved to {self.model_dir}")
