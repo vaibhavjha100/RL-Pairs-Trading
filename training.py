@@ -30,6 +30,9 @@ import time
 import argparse
 import random
 import pickle
+import json
+import shutil
+from datetime import datetime
 import numpy as np
 import pandas as pd
 import torch
@@ -41,10 +44,19 @@ from MPHDRL import (
     MPHDRLTrader,
     TradingEnvironment,
     PrioritizedReplayBuffer,
+    build_pair_ticker_mapping,
     check_data_readiness,
 )
 from benchmark import BENCHMARK_MODEL_DIR, BenchmarkDDPG
 from SRRL import SRRL_HPARAMS, SRRL_MODEL_DIR, SRRLTrader
+from backtest_core import (
+    load_sequence_bundle,
+    load_price_matrix,
+    get_all_weights_by_date,
+    get_mphdrl_weights_by_env,
+    run_strategy_backtest,
+    summarize_backtest_dataframe,
+)
 
 
 def set_global_seed(seed: int | None):
@@ -1374,6 +1386,184 @@ class SRRLTrainer(BaseTrainer):
 # CLI entry point
 # ============================================================================
 
+def _checkpoint_rank_key(ckpt_path: str):
+    base = os.path.basename(ckpt_path).lower()
+    if base == "final.pt":
+        return 10**9
+    if base.startswith("epoch_") and base.endswith(".pt"):
+        mid = base[len("epoch_") : -len(".pt")]
+        try:
+            return int(mid)
+        except ValueError:
+            return -1
+    return -1
+
+
+def _build_eval_model(agent_name: str, ckpt_path: str, f_dim: int, n_pairs: int, n_tickers: int, M, device: torch.device):
+    if agent_name == "MPHDRL":
+        model = MPHDRLTrader(f_dim, n_pairs, n_tickers, M, device=str(device))
+        model.load_checkpoint(ckpt_path)
+        model.eval()
+        return model
+    if agent_name == "Benchmark":
+        try:
+            raw_bench = torch.load(ckpt_path, map_location=str(device), weights_only=False)
+        except TypeError:
+            raw_bench = torch.load(ckpt_path, map_location=str(device))
+        hidden = int(raw_bench.get("meta", {}).get("hidden_size", 64))
+        model = BenchmarkDDPG(f_dim, n_pairs, n_tickers, M, hidden_size=hidden, device=str(device))
+        model.load_checkpoint(ckpt_path)
+        model.eval()
+        return model
+    if agent_name == "SRRL":
+        model = SRRLTrader(f_dim, n_pairs, n_tickers, M, device=str(device))
+        model.load_checkpoint(ckpt_path)
+        model.eval()
+        return model
+    raise ValueError(f"Unsupported agent_name: {agent_name}")
+
+
+def evaluate_and_promote_best_insample_checkpoint(
+    agent_name: str,
+    model_dir: str,
+    device: torch.device,
+    trained_epochs: int,
+    save_every: int,
+):
+    expected = {f"epoch_{e}.pt" for e in range(max(save_every, 1), trained_epochs + 1, max(save_every, 1))}
+    expected.add("final.pt")
+    ckpts = []
+    if os.path.isdir(model_dir):
+        for n in os.listdir(model_dir):
+            if n in expected:
+                ckpts.append(os.path.join(model_dir, n))
+    if not ckpts:
+        print(f"[in-sample] {agent_name}: no checkpoints found in {model_dir}, skipping promotion.")
+        return
+
+    x_train, y_train, pairs, meta_train = load_sequence_bundle(split="train")
+    n_pairs = len(pairs)
+    f_dim = x_train.shape[2]
+
+    hedge_path = os.path.join("data", "pickle", "hedge_ratios.pkl")
+    hedge_ratios = None
+    if os.path.isfile(hedge_path):
+        with open(hedge_path, "rb") as f:
+            hedge_ratios = pickle.load(f)
+    M, tickers, ticker_to_idx = build_pair_ticker_mapping(pairs, hedge_ratios=hedge_ratios)
+    n_tickers = len(tickers)
+    pair_key_to_idx = {f"{a}|{b}": i for i, (a, b) in enumerate(pairs)}
+
+    price_wide = load_price_matrix(tickers)
+    train_dates = sorted(meta_train["target_date"].unique())
+    valid_dates = [d for d in train_dates if d in price_wide.index]
+    if len(valid_dates) < 2:
+        print(f"[in-sample] {agent_name}: insufficient train dates for evaluation, skipping promotion.")
+        return
+
+    spread_raw_path = os.path.join("data", "spread", "raw.csv")
+    spread_wide = None
+    if os.path.isfile(spread_raw_path):
+        from traditional import load_precomputed_spread_wide
+
+        spread_wide = load_precomputed_spread_wide(spread_raw_path)
+
+    rows = []
+    for ckpt in sorted(ckpts, key=lambda p: (_checkpoint_rank_key(p), p)):
+        try:
+            model = _build_eval_model(agent_name, ckpt, f_dim, n_pairs, n_tickers, M, device)
+            if agent_name == "MPHDRL":
+                weights_by_date = get_mphdrl_weights_by_env(
+                    model,
+                    meta_train,
+                    x_train,
+                    y_train,
+                    pairs,
+                    tickers,
+                    ticker_to_idx,
+                    spread_wide=spread_wide,
+                    split="train",
+                )
+            else:
+                weights_by_date = get_all_weights_by_date(
+                    model, meta_train, x_train, pair_key_to_idx, n_pairs, f_dim, train_dates
+                )
+            df_bt = run_strategy_backtest(f"{agent_name} in-sample", weights_by_date, price_wide, tickers, valid_dates)
+            m = summarize_backtest_dataframe(df_bt, gamma=0.5)
+            rows.append(
+                {
+                    "checkpoint": os.path.abspath(ckpt),
+                    "checkpoint_name": os.path.basename(ckpt),
+                    "epoch_rank": _checkpoint_rank_key(ckpt),
+                    "status": "ok",
+                    **m,
+                }
+            )
+        except Exception as e:
+            rows.append(
+                {
+                    "checkpoint": os.path.abspath(ckpt),
+                    "checkpoint_name": os.path.basename(ckpt),
+                    "epoch_rank": _checkpoint_rank_key(ckpt),
+                    "status": "failed",
+                    "utility": float("-inf"),
+                    "annual_return": float("nan"),
+                    "variance": float("nan"),
+                    "sharpe": float("nan"),
+                    "mean_abs_weight": float("nan"),
+                    "l1_turnover": float("nan"),
+                    "transaction_cost": float("nan"),
+                    "shorting_cost": float("nan"),
+                    "error": str(e),
+                }
+            )
+
+    ok_rows = [r for r in rows if r.get("status") == "ok" and np.isfinite(r.get("utility", float("-inf")))]
+    if not ok_rows:
+        print(f"[in-sample] {agent_name}: all checkpoint evaluations failed; keeping existing final.pt.")
+        return
+
+    best = sorted(ok_rows, key=lambda r: (r["utility"], r["epoch_rank"]), reverse=True)[0]
+    best_ckpt = best["checkpoint"]
+    final_path = os.path.join(model_dir, "final.pt")
+    if os.path.abspath(best_ckpt) != os.path.abspath(final_path):
+        shutil.copy2(best_ckpt, final_path)
+
+    artifact_dir = os.path.join("artifacts", "insample_selection")
+    os.makedirs(artifact_dir, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_path = os.path.join(artifact_dir, f"{agent_name.lower()}_checkpoint_scores_{stamp}.csv")
+    json_path = os.path.join(artifact_dir, f"{agent_name.lower()}_selection_{stamp}.json")
+    pd.DataFrame(rows).to_csv(csv_path, index=False)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "agent": agent_name,
+                "timestamp": stamp,
+                "selected_checkpoint": best_ckpt,
+                "promoted_to": os.path.abspath(final_path),
+                "best_metrics": {
+                    "utility": best["utility"],
+                    "annual_return": best["annual_return"],
+                    "variance": best["variance"],
+                    "mean_abs_weight": best["mean_abs_weight"],
+                    "l1_turnover": best["l1_turnover"],
+                },
+                "num_evaluated": len(rows),
+                "num_ok": len(ok_rows),
+                "scores_csv": os.path.abspath(csv_path),
+            },
+            f,
+            indent=2,
+        )
+
+    print(
+        f"[in-sample] {agent_name}: promoted {os.path.basename(best_ckpt)} "
+        f"to final.pt (utility={best['utility']:.6f})"
+    )
+    print(f"[in-sample] report: {csv_path}")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
@@ -1470,6 +1660,14 @@ def main():
         print(f"\nStarting trainer: {agent_name}")
         trainer = trainer_cls(args, data)
         trainer.train()
+        print(f"\nRunning in-sample checkpoint selection for {agent_name}...")
+        evaluate_and_promote_best_insample_checkpoint(
+            agent_name,
+            trainer.model_dir,
+            resolved,
+            trained_epochs=args.epochs,
+            save_every=args.save_every,
+        )
 
 
 if __name__ == "__main__":

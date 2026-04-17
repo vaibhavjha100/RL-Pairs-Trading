@@ -28,6 +28,7 @@ import numpy as np
 import pandas as pd
 import torch
 
+from backtest_core import summarize_backtest_dataframe
 
 EPOCH_RE = re.compile(
     r"Epoch\s+\d+/\d+\s+\|\s+[0-9.]+s\s+\|\s+(?:(?P<phase>[a-zA-Z_]+)\s+\|\s+)?trans=\d+\s+\|\s+(?P<losses>.*?)\s+\|\s+"
@@ -180,6 +181,7 @@ def compute_utility_from_srrl_csv(csv_path: Path, gamma: float = 0.5) -> Dict[st
         return {
             "utility": float("-inf"),
             "annual_return": float("nan"),
+            "variance": float("nan"),
             "sharpe": float("nan"),
             "mean_abs_weight": float("nan"),
             "l1_turnover": float("nan"),
@@ -187,22 +189,7 @@ def compute_utility_from_srrl_csv(csv_path: Path, gamma: float = 0.5) -> Dict[st
             "shorting_cost": float("nan"),
         }
     df = pd.read_csv(csv_path)
-    r = pd.to_numeric(df["net_portfolio_return"], errors="coerce").fillna(0.0).to_numpy()
-    mu = float(np.mean(r))
-    var = float(np.var(r, ddof=1)) if len(r) > 1 else 0.0
-    ann_ret = mu * 252.0
-    utility = ann_ret - 0.5 * gamma * var * 252.0
-    sd = float(np.std(r, ddof=1)) if len(r) > 1 else 0.0
-    sharpe = (mu / sd) * math.sqrt(252.0) if sd > 1e-12 else float("nan")
-    return {
-        "utility": utility,
-        "annual_return": ann_ret,
-        "sharpe": sharpe,
-        "mean_abs_weight": float(df["mean_abs_weight"].mean()),
-        "l1_turnover": float(df["l1_turnover"].mean()),
-        "transaction_cost": float(df["transaction_cost"].mean()),
-        "shorting_cost": float(df["shorting_cost"].mean()),
-    }
+    return summarize_backtest_dataframe(df, gamma=gamma)
 
 
 def run_trial(
