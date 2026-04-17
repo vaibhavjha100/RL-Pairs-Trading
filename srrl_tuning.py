@@ -30,7 +30,7 @@ import torch
 
 
 EPOCH_RE = re.compile(
-    r"Epoch\s+\d+/\d+\s+\|\s+[0-9.]+s\s+\|\s+trans=\d+\s+\|\s+(?P<losses>.*?)\s+\|\s+"
+    r"Epoch\s+\d+/\d+\s+\|\s+[0-9.]+s\s+\|\s+(?:(?P<phase>[a-zA-Z_]+)\s+\|\s+)?trans=\d+\s+\|\s+(?P<losses>.*?)\s+\|\s+"
     r"sigma=(?P<sigma>[0-9.\-nan]+)\s+\|E\|=(?P<abs_e>[0-9.\-nan]+)\s+"
     r"churn=(?P<churn>[0-9.\-nan]+)\s+p_rev=(?P<p_rev>[0-9.\-nan]+)"
 )
@@ -144,10 +144,14 @@ def sample_stage2_params(rng: random.Random, base_cfg: Dict[str, float]) -> Dict
 
 
 def parse_last_epoch_metrics(train_output: str) -> Dict[str, float]:
-    matches = EPOCH_RE.findall(train_output)
+    matches = list(EPOCH_RE.finditer(train_output))
     if not matches:
         return {"churn": float("nan"), "abs_e": float("nan"), "p_rev": float("nan")}
-    _, sigma, abs_e, churn, p_rev = matches[-1]
+    last = matches[-1]
+    sigma = last.group("sigma")
+    abs_e = last.group("abs_e")
+    churn = last.group("churn")
+    p_rev = last.group("p_rev")
     return {
         "sigma": float(sigma),
         "abs_e": float(abs_e),
