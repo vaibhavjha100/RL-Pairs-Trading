@@ -1,22 +1,18 @@
 """
-training.py -- Agent-agnostic training harness for RL pairs trading.
+training.py -- SRRL training harness for RL pairs trading.
 
-Supports multiple RL agent types via a registry pattern:
+Default entrypoint trains SRRL only. Best hyperparameters are loaded from the
+tuning output directory (see --srrl-tuning-dir, default artifacts/srrl_tuning/trials.csv),
+then optional CLI --srrl-* flags override.
+
+Previously also supported (code retained, commented out):
     - MPHDRL: hybrid HDRL (TD3 critics, DDQN stop-loss, delayed actor + portfolio
       + auxiliary regression, PER). See multi_pair_hdrl_trader_architecture.md.
     - Benchmark: plain GRU actor–critic, DDPG-style replay on pair exposures E.
-    - SRRL: Supervised–RL hybrid — shared SRL encoders, per-pair mean-reversion
-      classifier (weighted BCE on y_bin32) gating a DDPG actor–critic; uniform
-      replay; no stop-loss head (uses spread_y_bin32_train.pkl labels). Optional
-      dropout (train-only), Adam weight decay, and BCE label smoothing reduce overfitting.
 
 Usage:
-    python training.py --agent Both --epochs 100
-    python training.py --agent MPHDRL --epochs 100
-    python training.py --agent MPHDRL --epochs 50 --device cuda
-    python training.py --agent MPHDRL --epochs 50 --device auto
-    python training.py --agent Benchmark --epochs 100 --device cuda
-    python training.py --agent SRRL --epochs 100
+    python training.py
+    python training.py --epochs 100 --device cuda
     python training.py --env-diagnostic-no-risk-tax  # diagnostic: no variance/tax/terminal bonus; costs on
 
 On CUDA (default): cudnn benchmark, TF32, fast H2D copies, mixed precision (bfloat16
@@ -39,6 +35,16 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 
+# from MPHDRL import (
+#     HPARAMS,
+#     MPHDRL_MODEL_DIR,
+#     MPHDRLTrader,
+#     TradingEnvironment,
+#     PrioritizedReplayBuffer,
+#     build_pair_ticker_mapping,
+#     check_data_readiness,
+# )
+# from benchmark import BENCHMARK_MODEL_DIR, BenchmarkDDPG
 from MPHDRL import (
     HPARAMS,
     MPHDRL_MODEL_DIR,
@@ -72,6 +78,56 @@ def set_global_seed(seed: int | None):
     if hasattr(torch.backends, "cudnn"):
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+
+
+def load_best_srrl_params_from_tuning(tuning_dir: str) -> bool:
+    """
+    Merge the best status=ok row (max utility) from tuning trials.csv into SRRL_HPARAMS.
+    Returns True if hyperparameters were loaded from disk.
+    """
+    trials_csv = os.path.join(tuning_dir, "trials.csv")
+    if not os.path.isfile(trials_csv):
+        print(f"SRRL tuning: no {trials_csv} — using defaults from SRRL.py")
+        return False
+    try:
+        df = pd.read_csv(trials_csv)
+    except Exception as e:
+        print(f"SRRL tuning: could not read {trials_csv}: {e}")
+        return False
+    if df.empty or "status" not in df.columns or "params" not in df.columns:
+        print(f"SRRL tuning: unexpected CSV shape in {trials_csv}")
+        return False
+    ok = df[df["status"] == "ok"].copy()
+    if ok.empty:
+        print("SRRL tuning: no status=ok rows — using defaults from SRRL.py")
+        return False
+    if "utility" in ok.columns:
+        ok["utility"] = pd.to_numeric(ok["utility"], errors="coerce")
+        ok = ok.dropna(subset=["utility"])
+    if ok.empty:
+        return False
+    ok = ok.sort_values("utility", ascending=False)
+    row = ok.iloc[0]
+    try:
+        raw_p = row["params"]
+        params = json.loads(raw_p) if isinstance(raw_p, str) else dict(raw_p)
+    except Exception as e:
+        print(f"SRRL tuning: could not parse params JSON: {e}")
+        return False
+    int_keys = {"n_step", "batch_size", "var_window", "cls_warmup_epochs"}
+    for key, val in params.items():
+        if key not in SRRL_HPARAMS:
+            continue
+        if key in int_keys:
+            SRRL_HPARAMS[key] = int(round(float(val)))
+        else:
+            SRRL_HPARAMS[key] = float(val) if isinstance(SRRL_HPARAMS[key], (int, float)) else val
+    if SRRL_HPARAMS["sigma_explore_min"] > SRRL_HPARAMS["sigma_explore"]:
+        SRRL_HPARAMS["sigma_explore_min"] = SRRL_HPARAMS["sigma_explore"]
+    tid = row.get("trial_id", "?")
+    util = float(row["utility"]) if "utility" in row else float("nan")
+    print(f"SRRL tuning: applied best trial_id={tid} utility={util:.6f} from {trials_csv}")
+    return True
 
 
 def apply_srrl_overrides(args):
@@ -239,7 +295,7 @@ class BaseTrainer:
 # MPHDRL Trainer
 # ============================================================================
 
-@register_agent("MPHDRL")
+# @register_agent("MPHDRL")
 class MPHDRLTrainer(BaseTrainer):
 
     def __init__(self, args, data):
@@ -650,7 +706,7 @@ class UniformReplayBuffer:
 # Benchmark (DDPG-style) trainer
 # ============================================================================
 
-@register_agent("Benchmark")
+# @register_agent("Benchmark")
 class BenchmarkTrainer(BaseTrainer):
     """Plain actor–critic: Gaussian E, same env reward as MPHDRL, uniform replay."""
 
@@ -1433,21 +1489,21 @@ def _checkpoint_rank_key(ckpt_path: str):
 
 
 def _build_eval_model(agent_name: str, ckpt_path: str, f_dim: int, n_pairs: int, n_tickers: int, M, device: torch.device):
-    if agent_name == "MPHDRL":
-        model = MPHDRLTrader(f_dim, n_pairs, n_tickers, M, device=str(device))
-        model.load_checkpoint(ckpt_path)
-        model.eval()
-        return model
-    if agent_name == "Benchmark":
-        try:
-            raw_bench = torch.load(ckpt_path, map_location=str(device), weights_only=False)
-        except TypeError:
-            raw_bench = torch.load(ckpt_path, map_location=str(device))
-        hidden = int(raw_bench.get("meta", {}).get("hidden_size", 64))
-        model = BenchmarkDDPG(f_dim, n_pairs, n_tickers, M, hidden_size=hidden, device=str(device))
-        model.load_checkpoint(ckpt_path)
-        model.eval()
-        return model
+    # if agent_name == "MPHDRL":
+    #     model = MPHDRLTrader(f_dim, n_pairs, n_tickers, M, device=str(device))
+    #     model.load_checkpoint(ckpt_path)
+    #     model.eval()
+    #     return model
+    # if agent_name == "Benchmark":
+    #     try:
+    #         raw_bench = torch.load(ckpt_path, map_location=str(device), weights_only=False)
+    #     except TypeError:
+    #         raw_bench = torch.load(ckpt_path, map_location=str(device))
+    #     hidden = int(raw_bench.get("meta", {}).get("hidden_size", 64))
+    #     model = BenchmarkDDPG(f_dim, n_pairs, n_tickers, M, hidden_size=hidden, device=str(device))
+    #     model.load_checkpoint(ckpt_path)
+    #     model.eval()
+    #     return model
     if agent_name == "SRRL":
         model = SRRLTrader(f_dim, n_pairs, n_tickers, M, device=str(device))
         model.load_checkpoint(ckpt_path)
@@ -1505,22 +1561,22 @@ def evaluate_and_promote_best_insample_checkpoint(
     for ckpt in sorted(ckpts, key=lambda p: (_checkpoint_rank_key(p), p)):
         try:
             model = _build_eval_model(agent_name, ckpt, f_dim, n_pairs, n_tickers, M, device)
-            if agent_name == "MPHDRL":
-                weights_by_date = get_mphdrl_weights_by_env(
-                    model,
-                    meta_train,
-                    x_train,
-                    y_train,
-                    pairs,
-                    tickers,
-                    ticker_to_idx,
-                    spread_wide=spread_wide,
-                    split="train",
-                )
-            else:
-                weights_by_date = get_all_weights_by_date(
-                    model, meta_train, x_train, pair_key_to_idx, n_pairs, f_dim, train_dates
-                )
+            # if agent_name == "MPHDRL":
+            #     weights_by_date = get_mphdrl_weights_by_env(
+            #         model,
+            #         meta_train,
+            #         x_train,
+            #         y_train,
+            #         pairs,
+            #         tickers,
+            #         ticker_to_idx,
+            #         spread_wide=spread_wide,
+            #         split="train",
+            #     )
+            # else:
+            weights_by_date = get_all_weights_by_date(
+                model, meta_train, x_train, pair_key_to_idx, n_pairs, f_dim, train_dates
+            )
             df_bt = run_strategy_backtest(f"{agent_name} in-sample", weights_by_date, price_wide, tickers, valid_dates)
             m = summarize_backtest_dataframe(df_bt, gamma=0.5)
             rows.append(
@@ -1600,13 +1656,19 @@ def evaluate_and_promote_best_insample_checkpoint(
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "RL Pairs Trading -- Training harness for MPHDRL, Benchmark (DDPG), "
-            "and SRRL (supervised–RL hybrid with binary reversion labels)."
+            "RL Pairs Trading -- SRRL training (supervised–RL hybrid). "
+            "Best hyperparameters load from --srrl-tuning-dir/trials.csv when present."
         )
     )
-    parser.add_argument("--agent", type=str, default="Both",
-                        choices=list(AGENT_REGISTRY.keys()) + ["Both"],
-                        help="Agent: MPHDRL, Benchmark, SRRL, or Both = MPHDRL then Benchmark (default: Both)")
+    parser.add_argument(
+        "--srrl-tuning-dir",
+        type=str,
+        default=os.path.join("artifacts", "srrl_tuning"),
+        help="Directory containing trials.csv from srrl_tuning.py (best row merged into SRRL_HPARAMS).",
+    )
+    parser.add_argument("--agent", type=str, default="SRRL",
+                        choices=["SRRL"],
+                        help="SRRL only (MPHDRL/Benchmark code kept in file but unregistered).")
     parser.add_argument("--epochs", type=int, default=100,
                         help="Number of training epochs (default: 100)")
     parser.add_argument("--device", type=str, default="auto",
@@ -1673,7 +1735,13 @@ def parse_args():
 def main():
     args = parse_args()
     set_global_seed(args.seed)
+    load_best_srrl_params_from_tuning(args.srrl_tuning_dir)
     apply_srrl_overrides(args)
+    cw = max(
+        0,
+        min(int(SRRL_HPARAMS.get("cls_warmup_epochs", 0)), max(0, args.epochs - 1)),
+    )
+    SRRL_HPARAMS["cls_warmup_epochs"] = cw
 
     resolved = resolve_training_device(args.device)
     configure_accelerator(resolved)
@@ -1692,8 +1760,7 @@ def main():
     if args.seed is not None:
         print(f"Seed: {args.seed}")
     print("=" * 60)
-    if args.agent in ("SRRL", "Both"):
-        print_srrl_hparams()
+    print_srrl_hparams()
 
     print("\nChecking data readiness...")
     ok, data = check_data_readiness()
@@ -1701,10 +1768,7 @@ def main():
         print("Data readiness failed. Run the preprocessing pipeline first.")
         sys.exit(1)
 
-    if args.agent == "Both":
-        agent_order = ["MPHDRL", "Benchmark"]
-    else:
-        agent_order = [args.agent]
+    agent_order = [args.agent]
 
     for agent_name in agent_order:
         trainer_cls = AGENT_REGISTRY.get(agent_name)
