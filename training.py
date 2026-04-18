@@ -1233,17 +1233,13 @@ class SRRLTrainer(BaseTrainer):
 
         batch = self.replay.sample(B)
 
-        sw = self._h2d(np.stack([t["state_windows"] for t in batch]))
-        E_g = self._h2d(np.stack([t["E_gated"] for t in batch]))
-        rews = self._h2d(np.array([t["reward"] for t in batch]))
-        nsw = self._h2d(np.stack([t["next_state_windows"] for t in batch]))
-        dones = self._h2d(np.array([t["done"] for t in batch]))
-        ns = self._h2d(np.array([t.get("n_step", 1) for t in batch]))
-        pmask = self._h2d(np.stack([t["pair_mask"] for t in batch]))
-        npmask = self._h2d(np.stack([t["next_pair_mask"] for t in batch]))
-
+        # Classification warm-up only needs state windows + labels + mask. Building full RL batches
+        # (next_state_windows, critic targets, etc.) here wastes RAM/GPU and can OOM when many
+        # update steps run per epoch (~num_steps).
         if epoch <= self.cls_warmup_epochs:
+            sw = self._h2d(np.stack([t["state_windows"] for t in batch]))
             y_cls = self._h2d(np.stack([t["y_bin32"] for t in batch]))
+            pmask = self._h2d(np.stack([t["pair_mask"] for t in batch]))
             # --- Phase 1: classification-only warm-up (no RL updates) ---
             h_cls = self.model.encode_all_pairs(sw, self.model.srl_cls)
             Bc, Pc, Hc = h_cls.shape
@@ -1258,6 +1254,15 @@ class SRRLTrainer(BaseTrainer):
             )
             self.opt_cls.step()
             return {"bce": bce.item()}
+
+        sw = self._h2d(np.stack([t["state_windows"] for t in batch]))
+        E_g = self._h2d(np.stack([t["E_gated"] for t in batch]))
+        rews = self._h2d(np.array([t["reward"] for t in batch]))
+        nsw = self._h2d(np.stack([t["next_state_windows"] for t in batch]))
+        dones = self._h2d(np.array([t["done"] for t in batch]))
+        ns = self._h2d(np.array([t.get("n_step", 1) for t in batch]))
+        pmask = self._h2d(np.stack([t["pair_mask"] for t in batch]))
+        npmask = self._h2d(np.stack([t["next_pair_mask"] for t in batch]))
 
         # --- Phase 2: RL-only updates (classification frozen) ---
         # --- Critic loss (DDPG-style, n-step) ---
