@@ -88,7 +88,15 @@ def load_price_matrix(tickers):
     if not os.path.isfile(raw_path):
         print(f"Missing {raw_path}. Run collection.py first.")
         sys.exit(1)
-    raw = pd.read_csv(raw_path, parse_dates=["Date"])
+    raw = pd.read_csv(
+        raw_path,
+        parse_dates=["Date"],
+        usecols=["Date", "Ticker", "Close"],
+    )
+    need = set(tickers)
+    raw = raw.loc[raw["Ticker"].isin(need), ["Date", "Ticker", "Close"]]
+    # Duplicate Date×Ticker rows break pivot/unstack and can explode memory; collapse explicitly.
+    raw = raw.sort_values(["Date", "Ticker"]).drop_duplicates(["Date", "Ticker"], keep="last")
     wide = raw.pivot(index="Date", columns="Ticker", values="Close").sort_index()
     missing_t = [t for t in tickers if t not in wide.columns]
     if missing_t:
