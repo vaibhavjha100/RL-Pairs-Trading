@@ -76,19 +76,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prune-churn", type=float, default=0.20)
     parser.add_argument("--outdir", type=str, default="artifacts/srrl_tuning")
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument(
-        "--srrl-cls-warmup-epochs",
-        type=int,
-        default=0,
-        dest="srrl_cls_warmup_epochs",
-        help="Forwarded to training.py: supervised cls warm-up epochs before joint SRRL updates.",
-    )
     return parser.parse_args()
 
 
 def stable_id(stage: str, params: Dict[str, float], seed: int) -> str:
     raw = json.dumps({"stage": stage, "seed": seed, "params": params}, sort_keys=True)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def cap_cls_warmup_epochs(params: Dict[str, float], epochs: int) -> Dict[str, float]:
+    """Keep cls warm-up within [0, epochs-1] so trial id matches training CLI."""
+    out = dict(params)
+    cw = max(0, min(int(round(float(out.get("cls_warmup_epochs", 0)))), max(0, epochs - 1)))
+    out["cls_warmup_epochs"] = cw
+    return out
 
 
 def ensure_dirs(root: Path, outdir: str) -> Dict[str, Path]:
@@ -126,6 +127,10 @@ def sample_stage1_params(rng: random.Random) -> Dict[str, float]:
         "sigma_explore": rng.uniform(0.15, 0.35),
         "sigma_explore_min": rng.uniform(0.03, 0.15),
         "tau": rng.uniform(0.002, 0.01),
+        "dropout": rng.uniform(0.0, 0.2),
+        "weight_decay": 10 ** rng.uniform(-5.0, -3.0),
+        "cls_label_smoothing": rng.uniform(0.0, 0.14),
+        "cls_warmup_epochs": rng.choice([0, 0, 2, 4, 8, 12, 16, 24, 32]),
     }
 
 
@@ -141,6 +146,16 @@ def sample_stage2_params(rng: random.Random, base_cfg: Dict[str, float]) -> Dict
     cfg["discount_gamma"] = rng.uniform(0.97, 0.995)
     cfg["gamma_risk"] = rng.choice([0.4, 0.5, 0.6])
     cfg["risk_lambda"] = rng.choice([0.8, 1.0, 1.2])
+    d0 = float(cfg.get("dropout", 0.12))
+    wd0 = float(cfg.get("weight_decay", 1e-4))
+    ls0 = float(cfg.get("cls_label_smoothing", 0.08))
+    cfg["dropout"] = float(np.clip(d0 + rng.uniform(-0.05, 0.05), 0.0, 0.25))
+    cfg["weight_decay"] = float(np.clip(wd0 * rng.uniform(0.5, 2.0), 1e-6, 5e-3))
+    cfg["cls_label_smoothing"] = float(np.clip(ls0 + rng.uniform(-0.04, 0.04), 0.0, 0.2))
+    cw0 = int(round(float(cfg.get("cls_warmup_epochs", 0))))
+    cfg["cls_warmup_epochs"] = int(
+        np.clip(cw0 + rng.choice([-8, -4, -2, 0, 2, 4, 8]), 0, 48)
+    )
     return cfg
 
 
@@ -202,8 +217,8 @@ def run_trial(
     seed: int,
     epochs: int,
     prune_churn: float,
-    cls_warmup_epochs: int = 0,
 ) -> TrialResult:
+    params = cap_cls_warmup_epochs(params, epochs)
     trial_id = stable_id(stage, params, seed)
     log_path = paths["logs"] / f"{stage}_{trial_id}.log"
     ckpt_path = paths["ckpt"] / f"{stage}_{trial_id}.pt"
@@ -242,8 +257,14 @@ def run_trial(
         train_cmd += ["--srrl-gamma-risk", str(params["gamma_risk"])]
     if "risk_lambda" in params:
         train_cmd += ["--srrl-risk-lambda", str(params["risk_lambda"])]
-    if cls_warmup_epochs > 0:
-        train_cmd += ["--srrl-cls-warmup-epochs", str(int(cls_warmup_epochs))]
+    if params.get("cls_warmup_epochs", 0) > 0:
+        train_cmd += ["--srrl-cls-warmup-epochs", str(int(params["cls_warmup_epochs"]))]
+    if "dropout" in params:
+        train_cmd += ["--srrl-dropout", str(params["dropout"])]
+    if "weight_decay" in params:
+        train_cmd += ["--srrl-weight-decay", str(params["weight_decay"])]
+    if "cls_label_smoothing" in params:
+        train_cmd += ["--srrl-cls-label-smoothing", str(params["cls_label_smoothing"])]
 
     train_proc = run_cmd(train_cmd, root)
     log_path.write_text(train_proc.stdout + "\n\nSTDERR:\n" + train_proc.stderr, encoding="utf-8")
@@ -412,6 +433,7 @@ def main():
         seen_ids = set()
 
     def maybe_run(stage: str, params: Dict[str, float], seed: int, epochs: int):
+        params = cap_cls_warmup_epochs(params, epochs)
         tid = stable_id(stage, params, seed)
         if tid in seen_ids:
             return
@@ -425,7 +447,6 @@ def main():
             seed=seed,
             epochs=epochs,
             prune_churn=args.prune_churn,
-            cls_warmup_epochs=args.srrl_cls_warmup_epochs,
         )
         append_trial(trials_csv, result)
         seen_ids.add(tid)
@@ -441,7 +462,12 @@ def main():
         "turnover_penalty": 0.05,
         "sigma_explore": 0.3,
         "sigma_explore_min": 0.10,
+        "dropout": 0.12,
+        "weight_decay": 1e-4,
+        "cls_label_smoothing": 0.08,
+        "cls_warmup_epochs": 0,
     }
+
     maybe_run("stage0_baseline", baseline_params, args.base_seed, args.stage1_epochs)
 
     for _ in range(args.stage1_trials):

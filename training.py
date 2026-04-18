@@ -7,7 +7,8 @@ Supports multiple RL agent types via a registry pattern:
     - Benchmark: plain GRU actor–critic, DDPG-style replay on pair exposures E.
     - SRRL: Supervised–RL hybrid — shared SRL encoders, per-pair mean-reversion
       classifier (weighted BCE on y_bin32) gating a DDPG actor–critic; uniform
-      replay; no stop-loss head (uses spread_y_bin32_train.pkl labels).
+      replay; no stop-loss head (uses spread_y_bin32_train.pkl labels). Optional
+      dropout (train-only), Adam weight decay, and BCE label smoothing reduce overfitting.
 
 Usage:
     python training.py --agent Both --epochs 100
@@ -89,6 +90,9 @@ def apply_srrl_overrides(args):
         "srrl_sigma_explore_min": "sigma_explore_min",
         "srrl_turnover_penalty": "turnover_penalty",
         "srrl_cls_warmup_epochs": "cls_warmup_epochs",
+        "srrl_dropout": "dropout",
+        "srrl_weight_decay": "weight_decay",
+        "srrl_cls_label_smoothing": "cls_label_smoothing",
     }
     for arg_key, hp_key in mapping.items():
         v = getattr(args, arg_key, None)
@@ -113,6 +117,9 @@ def print_srrl_hparams():
         "sigma_explore_min",
         "turnover_penalty",
         "cls_warmup_epochs",
+        "dropout",
+        "weight_decay",
+        "cls_label_smoothing",
     ]
     print("SRRL hyperparameters:")
     for k in keys:
@@ -1085,17 +1092,21 @@ class SRRLTrainer(BaseTrainer):
         self.replay = SRRLUniformReplay(buffer_cap)
 
         lr = SRRL_HPARAMS["lr"]
+        wd = float(SRRL_HPARAMS.get("weight_decay", 0.0) or 0.0)
         self.opt_cls = torch.optim.Adam(
             list(self.model.srl_cls.parameters()) + list(self.model.cls_head.parameters()),
             lr=lr,
+            weight_decay=wd,
         )
         self.opt_actor = torch.optim.Adam(
             list(self.model.srl_actor.parameters()) + list(self.model.actor.parameters()),
             lr=lr,
+            weight_decay=wd,
         )
         self.opt_critic = torch.optim.Adam(
             list(self.model.srl_critic.parameters()) + list(self.model.critic.parameters()),
             lr=lr,
+            weight_decay=wd,
         )
 
     def _h2d(self, arr, dtype=torch.float32):
@@ -1123,6 +1134,7 @@ class SRRLTrainer(BaseTrainer):
         return sigma_hi + (sigma_lo - sigma_hi) * frac
 
     def _collect_episode(self, epoch: int):
+        self.model.eval()
         state_info = self.env.reset()
         if state_info is None:
             return 0
@@ -1231,6 +1243,15 @@ class SRRLTrainer(BaseTrainer):
         if len(self.replay) < B:
             return {}
 
+        self.model.train()
+        for m in (
+            self.model.srl_actor_target,
+            self.model.actor_target,
+            self.model.srl_critic_target,
+            self.model.critic_target,
+        ):
+            m.eval()
+
         batch = self.replay.sample(B)
 
         # Classification warm-up only needs state windows + labels + mask. Building full RL batches
@@ -1246,13 +1267,19 @@ class SRRLTrainer(BaseTrainer):
             p_pred = self.model.cls_head(h_cls.reshape(Bc * Pc, Hc)).reshape(Bc, Pc)
             pos_w = torch.tensor(self.cls_pos_weight, device=sw.device, dtype=sw.dtype)
             weight_per = pmask * (y_cls * pos_w + (1.0 - y_cls) * 1.0)
-            bce = F.binary_cross_entropy(p_pred, y_cls, weight=weight_per)
+            ls = float(SRRL_HPARAMS.get("cls_label_smoothing", 0.0) or 0.0)
+            if ls > 0.0:
+                y_tgt = (y_cls * (1.0 - 2.0 * ls) + ls).clamp(0.0, 1.0)
+            else:
+                y_tgt = y_cls
+            bce = F.binary_cross_entropy(p_pred, y_tgt, weight=weight_per)
             self.opt_cls.zero_grad()
             bce.backward()
             torch.nn.utils.clip_grad_norm_(
                 list(self.model.srl_cls.parameters()) + list(self.model.cls_head.parameters()), 1.0
             )
             self.opt_cls.step()
+            self.model.eval()
             return {"bce": bce.item()}
 
         sw = self._h2d(np.stack([t["state_windows"] for t in batch]))
@@ -1324,6 +1351,7 @@ class SRRLTrainer(BaseTrainer):
 
         self.model.soft_update()
 
+        self.model.eval()
         return {"critic": loss_c.item(), "actor": loss_a.item(), "turn_pen": float(turn_pen.item())}
 
     def train(self):
@@ -1617,6 +1645,27 @@ def parse_args():
         default=None,
         dest="srrl_cls_warmup_epochs",
         help="SRRL: train only srl_cls + cls_head (BCE) for first N epochs, then joint RL (default: 0).",
+    )
+    parser.add_argument(
+        "--srrl-dropout",
+        type=float,
+        default=None,
+        dest="srrl_dropout",
+        help="SRRL: dropout probability on encoder outputs and MLP hidden layers (train-only; 0 disables).",
+    )
+    parser.add_argument(
+        "--srrl-weight-decay",
+        type=float,
+        default=None,
+        dest="srrl_weight_decay",
+        help="SRRL: Adam L2 weight decay on all SRRL parameter groups.",
+    )
+    parser.add_argument(
+        "--srrl-cls-label-smoothing",
+        type=float,
+        default=None,
+        dest="srrl_cls_label_smoothing",
+        help="SRRL: BCE label smoothing (blend toward 0.5); 0 disables.",
     )
     return parser.parse_args()
 

@@ -39,6 +39,10 @@ SRRL_HPARAMS = {
     "sigma_explore_min": 0.10,
     "turnover_penalty": 0.05,
     "cls_warmup_epochs": 0,
+    # Anti–overfitting (train-time only; rollout uses eval mode)
+    "dropout": 0.12,
+    "weight_decay": 1e-4,
+    "cls_label_smoothing": 0.08,
 }
 
 SRRL_MODEL_DIR = os.path.join("models", "srrl")
@@ -57,16 +61,20 @@ class GateLayer(nn.Module):
 
 
 class SRLEncoder(nn.Module):
-    def __init__(self, feature_dim, hidden_size=128):
+    def __init__(self, feature_dim, hidden_size=128, dropout: float = 0.0):
         super().__init__()
         self.gate = GateLayer(feature_dim)
         self.lstm = nn.LSTM(feature_dim, hidden_size, num_layers=1, batch_first=True)
         self.hidden_size = hidden_size
+        self.dropout_p = float(dropout or 0.0)
 
     def forward(self, x):
         gated = self.gate(x)
         _, (h_n, _) = self.lstm(gated)
-        return h_n.squeeze(0)
+        h = h_n.squeeze(0)
+        if self.dropout_p > 0.0:
+            h = F.dropout(h, p=self.dropout_p, training=self.training)
+        return h
 
 
 # ---------------------------------------------------------------------------
@@ -74,16 +82,16 @@ class SRLEncoder(nn.Module):
 # ---------------------------------------------------------------------------
 
 class ClassificationHead(nn.Module):
-    def __init__(self, hidden_size=128):
+    def __init__(self, hidden_size=128, dropout: float = 0.0):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(hidden_size, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
-        )
+        self.fc1 = nn.Linear(hidden_size, 64)
+        self.fc2 = nn.Linear(64, 1)
+        self.dropout_p = float(dropout or 0.0)
 
     def forward(self, h):
-        return torch.sigmoid(self.net(h)).squeeze(-1)
+        x = F.relu(self.fc1(h))
+        x = F.dropout(x, p=self.dropout_p, training=self.training)
+        return torch.sigmoid(self.fc2(x)).squeeze(-1)
 
 
 # ---------------------------------------------------------------------------
@@ -91,17 +99,16 @@ class ClassificationHead(nn.Module):
 # ---------------------------------------------------------------------------
 
 class DDPGActor(nn.Module):
-    def __init__(self, hidden_size=128):
+    def __init__(self, hidden_size=128, dropout: float = 0.0):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(hidden_size, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1),
-            nn.Tanh(),
-        )
+        self.fc1 = nn.Linear(hidden_size, 64)
+        self.fc2 = nn.Linear(64, 1)
+        self.dropout_p = float(dropout or 0.0)
 
     def forward(self, h):
-        return self.net(h).squeeze(-1)
+        x = F.relu(self.fc1(h))
+        x = F.dropout(x, p=self.dropout_p, training=self.training)
+        return torch.tanh(self.fc2(x)).squeeze(-1)
 
 
 # ---------------------------------------------------------------------------
@@ -109,19 +116,19 @@ class DDPGActor(nn.Module):
 # ---------------------------------------------------------------------------
 
 class DDPGCritic(nn.Module):
-    def __init__(self, state_dim, action_dim):
+    def __init__(self, state_dim, action_dim, dropout: float = 0.0):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(state_dim + action_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Linear(128, 1),
-        )
+        self.l1 = nn.Linear(state_dim + action_dim, 256)
+        self.l2 = nn.Linear(256, 128)
+        self.l3 = nn.Linear(128, 1)
+        self.dropout_p = float(dropout or 0.0)
 
     def forward(self, state_pooled, actions_flat):
         x = torch.cat([state_pooled, actions_flat], dim=-1)
-        return self.net(x).squeeze(-1)
+        x = F.relu(self.l1(x))
+        x = F.dropout(x, p=self.dropout_p, training=self.training)
+        x = F.relu(self.l2(x))
+        return self.l3(x).squeeze(-1)
 
 
 # ---------------------------------------------------------------------------
@@ -152,16 +159,17 @@ class SRRLTrader(nn.Module):
         self.n_pairs = n_pairs
         self.n_tickers = n_tickers
         H = SRRL_HPARAMS["H_srl"]
+        do = float(SRRL_HPARAMS.get("dropout", 0.0) or 0.0)
 
         self.register_buffer("M", torch.tensor(M_numpy, dtype=torch.float32))
 
-        self.srl_cls = SRLEncoder(feature_dim, H)
-        self.srl_actor = SRLEncoder(feature_dim, H)
-        self.srl_critic = SRLEncoder(feature_dim, H)
+        self.srl_cls = SRLEncoder(feature_dim, H, dropout=do)
+        self.srl_actor = SRLEncoder(feature_dim, H, dropout=do)
+        self.srl_critic = SRLEncoder(feature_dim, H, dropout=do)
 
-        self.cls_head = ClassificationHead(H)
-        self.actor = DDPGActor(H)
-        self.critic = DDPGCritic(H, n_pairs)
+        self.cls_head = ClassificationHead(H, dropout=do)
+        self.actor = DDPGActor(H, dropout=do)
+        self.critic = DDPGCritic(H, n_pairs, dropout=do)
 
         self.srl_actor_target = copy.deepcopy(self.srl_actor)
         self.actor_target = copy.deepcopy(self.actor)
@@ -169,6 +177,7 @@ class SRRLTrader(nn.Module):
         self.critic_target = copy.deepcopy(self.critic)
         self._freeze_targets()
         self.to(self._device)
+        self.eval()
 
     @property
     def device(self) -> torch.device:
@@ -300,14 +309,67 @@ class SRRLTrader(nn.Module):
             state = torch.load(path, map_location=self._device, weights_only=False)
         except TypeError:
             state = torch.load(path, map_location=self._device)
-        self.srl_cls.load_state_dict(state["srl_cls"])
-        self.srl_actor.load_state_dict(state["srl_actor"])
-        self.srl_critic.load_state_dict(state["srl_critic"])
-        self.cls_head.load_state_dict(state["cls_head"])
-        self.actor.load_state_dict(state["actor"])
-        self.critic.load_state_dict(state["critic"])
-        self.srl_actor_target.load_state_dict(state["srl_actor_target"])
-        self.actor_target.load_state_dict(state["actor_target"])
-        self.srl_critic_target.load_state_dict(state["srl_critic_target"])
-        self.critic_target.load_state_dict(state["critic_target"])
+
+        def _remap_two_layer_fc(sd: dict) -> dict:
+            """Old checkpoints: Sequential net.0 / net.2 -> fc1 / fc2."""
+            if not sd or any(k.startswith("fc1.") for k in sd):
+                return sd
+            if not any(k.startswith("net.0.") for k in sd):
+                return sd
+            out = {}
+            for k, v in sd.items():
+                if k.startswith("net.0."):
+                    out["fc1." + k[6:]] = v
+                elif k.startswith("net.2."):
+                    out["fc2." + k[6:]] = v
+            return out
+
+        def _remap_critic_sequential(sd: dict) -> dict:
+            """Old checkpoints: net.0 / net.2 / net.4 -> l1 / l2 / l3."""
+            if not sd or any(k.startswith("l1.") for k in sd):
+                return sd
+            if not any(k.startswith("net.0.") for k in sd):
+                return sd
+            out = {}
+            for k, v in sd.items():
+                if k.startswith("net.0."):
+                    out["l1." + k[6:]] = v
+                elif k.startswith("net.2."):
+                    out["l2." + k[6:]] = v
+                elif k.startswith("net.4."):
+                    out["l3." + k[6:]] = v
+            return out
+
+        state = dict(state)
+        if "cls_head" in state:
+            state["cls_head"] = _remap_two_layer_fc(state["cls_head"])
+        if "actor" in state:
+            state["actor"] = _remap_two_layer_fc(state["actor"])
+        if "critic" in state:
+            state["critic"] = _remap_critic_sequential(state["critic"])
+        if "actor_target" in state:
+            state["actor_target"] = _remap_two_layer_fc(state["actor_target"])
+        if "critic_target" in state:
+            state["critic_target"] = _remap_critic_sequential(state["critic_target"])
+
+        def _load(module, key):
+            if key not in state:
+                return
+            missing, unexpected = module.load_state_dict(state[key], strict=False)
+            if missing or unexpected:
+                print(
+                    f"  Note: partial load for {key}: "
+                    f"missing={len(missing)} unexpected={len(unexpected)}"
+                )
+
+        _load(self.srl_cls, "srl_cls")
+        _load(self.srl_actor, "srl_actor")
+        _load(self.srl_critic, "srl_critic")
+        _load(self.cls_head, "cls_head")
+        _load(self.actor, "actor")
+        _load(self.critic, "critic")
+        _load(self.srl_actor_target, "srl_actor_target")
+        _load(self.actor_target, "actor_target")
+        _load(self.srl_critic_target, "srl_critic_target")
+        _load(self.critic_target, "critic_target")
         print(f"Checkpoint loaded: {path}")
