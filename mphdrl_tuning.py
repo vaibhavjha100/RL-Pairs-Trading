@@ -1,23 +1,23 @@
 """
-SRRL hyperparameter tuning runner.
-
-Primary project workflow uses MPHDRL — see mphdrl_tuning.py for the default tuner.
+MPHDRL hyperparameter tuning runner.
 
 Stages:
   - Stage 0 baseline
   - Stage 1 coarse random search
   - Stage 2 focused refinement around top configs
   - Stage 3 seed confirmation for finalists
+
+Training is invoked via environment variables (see training.py): MPHDRL_HP_PATCH, etc.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import os
 import hashlib
 import json
 import math
+import os
 import random
 import re
 import shutil
@@ -29,14 +29,24 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
+import pickle
 import torch
 
-from backtest_core import summarize_backtest_dataframe
+from MPHDRL import MPHDRLTrader, build_pair_ticker_mapping
 
+from backtest_core import (
+    load_price_matrix,
+    load_sequence_bundle,
+    get_mphdrl_weights_by_env,
+    run_strategy_backtest,
+    summarize_backtest_dataframe,
+)
+
+from training import merge_mphdrl_params_dict
+
+# MPHDRL logs: Epoch .../... | ...s | trans=... | loss keys (no SRRL sigma/churn line)
 EPOCH_RE = re.compile(
-    r"Epoch\s+\d+/\d+\s+\|\s+[0-9.]+s\s+\|\s+(?:(?P<phase>[a-zA-Z_]+)\s+\|\s+)?trans=\d+\s+\|\s+(?P<losses>.*?)\s+\|\s+"
-    r"sigma=(?P<sigma>[0-9.\-nan]+)\s+\|E\|=(?P<abs_e>[0-9.\-nan]+)\s+"
-    r"churn=(?P<churn>[0-9.\-nan]+)\s+p_rev=(?P<p_rev>[0-9.\-nan]+)"
+    r"Epoch\s+\d+/\d+\s+\|\s+[0-9.]+s\s+\|\s+trans=\d+\s+\|\s+(?P<losses>.+)"
 )
 
 
@@ -63,7 +73,7 @@ class TrialResult:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Tune SRRL hyperparameters.")
+    parser = argparse.ArgumentParser(description="Tune MPHDRL hyperparameters.")
     parser.add_argument("--python-bin", type=str, default=sys.executable)
     parser.add_argument("--root", type=str, default=str(Path(__file__).resolve().parent))
     parser.add_argument("--device", type=str, default="auto")
@@ -76,8 +86,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--confirm-seeds", type=int, default=2)
     parser.add_argument("--topk-stage1", type=int, default=6)
     parser.add_argument("--topk-stage2", type=int, default=3)
-    parser.add_argument("--prune-churn", type=float, default=0.20)
-    parser.add_argument("--outdir", type=str, default="artifacts/srrl_tuning")
+    parser.add_argument("--prune-churn", type=float, default=0.99)
+    parser.add_argument("--outdir", type=str, default="artifacts/mphdrl_tuning")
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
 
@@ -85,11 +95,6 @@ def parse_args() -> argparse.Namespace:
 def stable_id(stage: str, params: Dict[str, float], seed: int) -> str:
     raw = json.dumps({"stage": stage, "seed": seed, "params": params}, sort_keys=True)
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
-
-
-def cap_cls_warmup_epochs(params: Dict[str, float], epochs: int) -> Dict[str, float]:
-    """Copy params for trial identity; training.py splits epochs half cls / half RL automatically."""
-    return dict(params)
 
 
 def ensure_dirs(root: Path, outdir: str) -> Dict[str, Path]:
@@ -122,40 +127,42 @@ def sample_stage1_params(rng: random.Random) -> Dict[str, float]:
     lr = 10 ** rng.uniform(math.log10(5e-5), math.log10(5e-4))
     return {
         "lr": lr,
-        "n_step": rng.choice([5, 10, 15, 20]),
-        "turnover_penalty": rng.choice([0.0, 0.01, 0.03, 0.05, 0.1]),
-        "sigma_explore": rng.uniform(0.15, 0.35),
-        "sigma_explore_min": rng.uniform(0.03, 0.15),
-        "tau": rng.uniform(0.002, 0.01),
-        "dropout": rng.uniform(0.0, 0.2),
-        "weight_decay": 10 ** rng.uniform(-5.0, -3.0),
-        "cls_label_smoothing": rng.uniform(0.0, 0.14),
-        "cls_warmup_epochs": rng.choice([0, 0, 2, 4, 8, 12, 16, 24, 32]),
+        "tau": rng.uniform(0.002, 0.012),
+        "n_step": float(rng.choice([5, 10, 15, 20])),
+        "sigma_explore": rng.uniform(0.4, 0.95),
+        "sigma_smooth": rng.uniform(0.4, 0.95),
+        "batch_size": float(rng.choice([16, 32, 64])),
+        "discount_gamma": rng.uniform(0.97, 0.995),
+        "per_alpha": rng.uniform(0.4, 0.75),
+        "per_beta_start": rng.uniform(0.25, 0.55),
+        "zeta": 10 ** rng.uniform(math.log10(1e-4), math.log10(0.02)),
+        "gamma": rng.uniform(0.35, 0.65),
+        "risk_lambda": rng.uniform(0.7, 1.4),
+        "terminal_utility_weight": rng.uniform(0.5, 1.5),
+        "delay_c": float(rng.choice([2, 4, 6, 8])),
+        "delay_b": float(rng.choice([1, 2, 3, 4])),
     }
 
 
 def sample_stage2_params(rng: random.Random, base_cfg: Dict[str, float]) -> Dict[str, float]:
     cfg = dict(base_cfg)
-    cfg["lr"] = float(np.clip(cfg["lr"] * rng.uniform(0.7, 1.3), 5e-5, 5e-4))
-    cfg["tau"] = float(np.clip(cfg["tau"] * rng.uniform(0.7, 1.3), 0.002, 0.01))
-    cfg["turnover_penalty"] = rng.choice([0.0, 0.01, 0.03, 0.05, 0.1])
-    cfg["sigma_explore"] = float(np.clip(cfg["sigma_explore"] + rng.uniform(-0.05, 0.05), 0.15, 0.35))
-    cfg["sigma_explore_min"] = float(np.clip(cfg["sigma_explore_min"] + rng.uniform(-0.03, 0.03), 0.03, 0.15))
-    cfg["sigma_explore_min"] = min(cfg["sigma_explore_min"], cfg["sigma_explore"])
-    cfg["batch_size"] = rng.choice([32, 64])
-    cfg["discount_gamma"] = rng.uniform(0.97, 0.995)
-    cfg["gamma_risk"] = rng.choice([0.4, 0.5, 0.6])
-    cfg["risk_lambda"] = rng.choice([0.8, 1.0, 1.2])
-    d0 = float(cfg.get("dropout", 0.12))
-    wd0 = float(cfg.get("weight_decay", 1e-4))
-    ls0 = float(cfg.get("cls_label_smoothing", 0.08))
-    cfg["dropout"] = float(np.clip(d0 + rng.uniform(-0.05, 0.05), 0.0, 0.25))
-    cfg["weight_decay"] = float(np.clip(wd0 * rng.uniform(0.5, 2.0), 1e-6, 5e-3))
-    cfg["cls_label_smoothing"] = float(np.clip(ls0 + rng.uniform(-0.04, 0.04), 0.0, 0.2))
-    cw0 = int(round(float(cfg.get("cls_warmup_epochs", 0))))
-    cfg["cls_warmup_epochs"] = int(
-        np.clip(cw0 + rng.choice([-8, -4, -2, 0, 2, 4, 8]), 0, 48)
+    cfg["lr"] = float(np.clip(cfg["lr"] * rng.uniform(0.75, 1.25), 5e-5, 5e-4))
+    cfg["tau"] = float(np.clip(cfg["tau"] * rng.uniform(0.75, 1.25), 0.002, 0.015))
+    cfg["sigma_explore"] = float(np.clip(cfg["sigma_explore"] + rng.uniform(-0.1, 0.1), 0.25, 1.0))
+    cfg["sigma_smooth"] = float(np.clip(cfg["sigma_smooth"] + rng.uniform(-0.1, 0.1), 0.25, 1.0))
+    cfg["batch_size"] = float(rng.choice([16, 32, 64]))
+    cfg["discount_gamma"] = float(np.clip(cfg["discount_gamma"] + rng.uniform(-0.015, 0.015), 0.96, 0.999))
+    cfg["per_alpha"] = float(np.clip(cfg["per_alpha"] + rng.uniform(-0.08, 0.08), 0.3, 0.85))
+    cfg["per_beta_start"] = float(np.clip(cfg["per_beta_start"] + rng.uniform(-0.08, 0.08), 0.15, 0.65))
+    cfg["zeta"] = float(np.clip(cfg["zeta"] * rng.uniform(0.5, 2.0), 1e-5, 0.05))
+    cfg["gamma"] = float(np.clip(cfg["gamma"] + rng.uniform(-0.08, 0.08), 0.25, 0.75))
+    cfg["risk_lambda"] = float(np.clip(cfg["risk_lambda"] + rng.uniform(-0.15, 0.15), 0.5, 2.0))
+    cfg["terminal_utility_weight"] = float(
+        np.clip(cfg["terminal_utility_weight"] + rng.uniform(-0.25, 0.25), 0.25, 2.0)
     )
+    cfg["delay_c"] = float(rng.choice([2, 4, 6, 8]))
+    cfg["delay_b"] = float(rng.choice([1, 2, 3, 4]))
+    cfg["n_step"] = float(rng.choice([5, 10, 15, 20]))
     return cfg
 
 
@@ -164,16 +171,17 @@ def parse_last_epoch_metrics(train_output: str) -> Dict[str, float]:
     if not matches:
         return {"churn": float("nan"), "abs_e": float("nan"), "p_rev": float("nan")}
     last = matches[-1]
-    sigma = last.group("sigma")
-    abs_e = last.group("abs_e")
-    churn = last.group("churn")
-    p_rev = last.group("p_rev")
-    return {
-        "sigma": float(sigma),
-        "abs_e": float(abs_e),
-        "churn": float(churn),
-        "p_rev": float(p_rev),
-    }
+    loss_blob = last.group("losses") or ""
+    churn = float("nan")
+    if "churn=" in loss_blob:
+        for part in loss_blob.replace("|", " ").split():
+            if part.startswith("churn="):
+                try:
+                    churn = float(part.split("=", 1)[1])
+                except ValueError:
+                    pass
+                break
+    return {"churn": churn, "abs_e": float("nan"), "p_rev": float("nan")}
 
 
 def run_cmd(
@@ -196,7 +204,7 @@ def resolve_device(preference: str) -> str:
     return name
 
 
-def compute_utility_from_srrl_csv(csv_path: Path, gamma: float = 0.5) -> Dict[str, float]:
+def compute_utility_from_mphdrl_csv(csv_path: Path, gamma: float = 0.5) -> Dict[str, float]:
     if not csv_path.exists():
         return {
             "utility": float("-inf"),
@@ -212,6 +220,58 @@ def compute_utility_from_srrl_csv(csv_path: Path, gamma: float = 0.5) -> Dict[st
     return summarize_backtest_dataframe(df, gamma=gamma)
 
 
+def score_mphdrl_checkpoint(root: Path, ckpt_path: Path, params: Dict[str, float], device_pref: str) -> Dict[str, float]:
+    """
+    Walk-forward utility on the test split (same gamma as training in-sample selection).
+    Merges trial params into HPARAMS so env reward matches the trained run.
+    """
+    merge_mphdrl_params_dict(params)
+    dev_str = resolve_device(device_pref)
+    device = torch.device(dev_str)
+
+    x_test, y_test, pairs, meta_test = load_sequence_bundle(split="test")
+    n_pairs = len(pairs)
+    f_dim = x_test.shape[2]
+
+    hedge_path = root / "data" / "pickle" / "hedge_ratios.pkl"
+    hedge_ratios = None
+    if hedge_path.is_file():
+        with open(hedge_path, "rb") as f:
+            hedge_ratios = pickle.load(f)
+    M, tickers, ticker_to_idx = build_pair_ticker_mapping(pairs, hedge_ratios=hedge_ratios)
+
+    model = MPHDRLTrader(f_dim, n_pairs, len(tickers), M, device=str(device))
+    model.load_checkpoint(str(ckpt_path))
+    model.eval()
+
+    spread_raw_path = root / "data" / "spread" / "raw.csv"
+    spread_wide = None
+    if spread_raw_path.is_file():
+        from traditional import load_precomputed_spread_wide
+
+        spread_wide = load_precomputed_spread_wide(str(spread_raw_path))
+
+    weights_by_date = get_mphdrl_weights_by_env(
+        model,
+        meta_test,
+        x_test,
+        y_test,
+        pairs,
+        tickers,
+        ticker_to_idx,
+        spread_wide=spread_wide,
+        split="test",
+    )
+    price_wide = load_price_matrix(tickers)
+    test_dates = sorted(meta_test["target_date"].unique())
+    valid_dates = [d for d in test_dates if d in price_wide.index]
+    if len(valid_dates) < 2:
+        return compute_utility_from_mphdrl_csv(Path())
+
+    df_bt = run_strategy_backtest("MPHDRL tuning", weights_by_date, price_wide, tickers, valid_dates)
+    return summarize_backtest_dataframe(df_bt, gamma=0.5)
+
+
 def run_trial(
     root: Path,
     paths: Dict[str, Path],
@@ -223,19 +283,18 @@ def run_trial(
     epochs: int,
     prune_churn: float,
 ) -> TrialResult:
-    params = cap_cls_warmup_epochs(params, epochs)
     trial_id = stable_id(stage, params, seed)
     log_path = paths["logs"] / f"{stage}_{trial_id}.log"
     ckpt_path = paths["ckpt"] / f"{stage}_{trial_id}.pt"
 
-    patch_path = paths["base"] / f"srrl_hp_patch_{trial_id}.json"
+    patch_path = paths["base"] / f"mphdrl_hp_patch_{trial_id}.json"
     patch_path.write_text(json.dumps(params, sort_keys=True), encoding="utf-8")
     trial_env = os.environ.copy()
-    trial_env["SRRL_HP_PATCH"] = str(patch_path.resolve())
-    trial_env["SRRL_TRAIN_EPOCHS"] = str(epochs)
-    trial_env["SRRL_SAVE_EVERY"] = str(epochs)
-    trial_env["SRRL_DEVICE"] = device
-    trial_env["SRRL_SEED"] = str(seed)
+    trial_env["MPHDRL_HP_PATCH"] = str(patch_path.resolve())
+    trial_env["MPHDRL_TRAIN_EPOCHS"] = str(epochs)
+    trial_env["MPHDRL_SAVE_EVERY"] = str(epochs)
+    trial_env["MPHDRL_DEVICE"] = device
+    trial_env["MPHDRL_SEED"] = str(seed)
 
     train_cmd = [pybin, "training.py"]
 
@@ -285,7 +344,7 @@ def run_trial(
             note=f"churn {m['churn']:.4f} > prune_churn {prune_churn:.4f}",
         )
 
-    final_ckpt = root / "models" / "srrl" / "final.pt"
+    final_ckpt = root / "models" / "MPHDRL" / "final.pt"
     if final_ckpt.exists():
         shutil.copy2(final_ckpt, ckpt_path)
     else:
@@ -307,24 +366,14 @@ def run_trial(
             p_rev=m["p_rev"],
             checkpoint_path="",
             train_log_path=str(log_path),
-            note="models/srrl/final.pt not found",
+            note="models/MPHDRL/final.pt not found",
         )
 
-    bt_cmd = [
-        pybin,
-        "backtest.py",
-        "--device",
-        device,
-        "--srrl-checkpoint",
-        str(ckpt_path),
-    ]
-    bt_proc = run_cmd(bt_cmd, root)
-    with log_path.open("a", encoding="utf-8") as f:
-        f.write("\n\nBACKTEST STDOUT:\n")
-        f.write(bt_proc.stdout)
-        f.write("\n\nBACKTEST STDERR:\n")
-        f.write(bt_proc.stderr)
-    if bt_proc.returncode != 0:
+    try:
+        metrics = score_mphdrl_checkpoint(root, ckpt_path, params, device)
+    except Exception as e:
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(f"\n\nSCORE EXCEPTION:\n{e}\n")
         return TrialResult(
             stage=stage,
             trial_id=trial_id,
@@ -343,10 +392,8 @@ def run_trial(
             p_rev=m["p_rev"],
             checkpoint_path=str(ckpt_path),
             train_log_path=str(log_path),
-            note=f"backtest return code {bt_proc.returncode}",
+            note=f"score_mphdrl_checkpoint failed: {e}",
         )
-
-    metrics = compute_utility_from_srrl_csv(root / "data" / "backtest" / "srrl.csv")
     return TrialResult(
         stage=stage,
         trial_id=trial_id,
@@ -406,7 +453,6 @@ def main():
         seen_ids = set()
 
     def maybe_run(stage: str, params: Dict[str, float], seed: int, epochs: int):
-        params = cap_cls_warmup_epochs(params, epochs)
         tid = stable_id(stage, params, seed)
         if tid in seen_ids:
             return
@@ -431,14 +477,19 @@ def main():
     baseline_params = {
         "lr": 1e-4,
         "tau": 0.005,
-        "n_step": 10,
-        "turnover_penalty": 0.05,
-        "sigma_explore": 0.3,
-        "sigma_explore_min": 0.10,
-        "dropout": 0.12,
-        "weight_decay": 1e-4,
-        "cls_label_smoothing": 0.08,
-        "cls_warmup_epochs": 0,
+        "n_step": 10.0,
+        "sigma_explore": 0.7,
+        "sigma_smooth": 0.7,
+        "batch_size": 32.0,
+        "discount_gamma": 0.99,
+        "per_alpha": 0.6,
+        "per_beta_start": 0.4,
+        "zeta": 0.003,
+        "gamma": 0.5,
+        "risk_lambda": 1.0,
+        "terminal_utility_weight": 1.0,
+        "delay_c": 4.0,
+        "delay_b": 2.0,
     }
 
     maybe_run("stage0_baseline", baseline_params, args.base_seed, args.stage1_epochs)

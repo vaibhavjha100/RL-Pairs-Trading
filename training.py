@@ -1,21 +1,18 @@
 """
-training.py -- SRRL training harness for RL pairs trading.
+training.py -- MPHDRL training harness for RL pairs trading.
 
 Run with no arguments:
     python training.py
 
-Hyperparameters default from SRRL.py, then optional merge from artifacts/srrl_tuning/trials.csv
-(best trial). Classification trains for the first half of epochs; RL for the remainder
-(e.g. 100 epochs -> 50 cls-only, then 50 RL-only).
+Hyperparameters default from MPHDRL.HPARAMS, then optional merge from artifacts/mphdrl_tuning/trials.csv
+(best trial). Single continuous RL schedule (no classification phase).
 
-Optional environment overrides (for automation / srrl_tuning.py):
-    SRRL_TRAIN_EPOCHS, SRRL_DEVICE, SRRL_SEED, SRRL_SAVE_EVERY, SRRL_TUNING_DIR,
-    SRRL_HP_PATCH (path to JSON hyperparameter patch), SRRL_NO_AMP, SRRL_NO_COMPILE,
-    SRRL_DIAG_NO_RISK_TAX.
+Optional environment overrides (for automation / mphdrl_tuning.py):
+    MPHDRL_TRAIN_EPOCHS, MPHDRL_DEVICE, MPHDRL_SEED, MPHDRL_SAVE_EVERY, MPHDRL_TUNING_DIR,
+    MPHDRL_HP_PATCH (path to JSON hyperparameter patch), MPHDRL_NO_AMP, MPHDRL_NO_COMPILE,
+    MPHDRL_DIAG_NO_RISK_TAX.
 
-Previously also supported (code retained, commented out):
-    - MPHDRL: hybrid HDRL ...
-    - Benchmark: plain GRU actor–critic ...
+SRRL trainer code is retained below but commented out of the registry.
 
 On CUDA (default): cudnn benchmark, TF32, mixed precision, torch.compile unless disabled.
 """
@@ -55,6 +52,7 @@ from MPHDRL import (
     check_data_readiness,
 )
 from benchmark import BENCHMARK_MODEL_DIR, BenchmarkDDPG
+# SRRL trainer disabled by default; keep imports so SRRL class bodies parse if restored.
 from SRRL import SRRL_HPARAMS, SRRL_MODEL_DIR, SRRLTrader
 from backtest_core import (
     load_sequence_bundle,
@@ -65,12 +63,11 @@ from backtest_core import (
     summarize_backtest_dataframe,
 )
 
-# Defaults when running `python training.py` with no CLI (override via SRRL_* env vars).
+# Defaults when running `python training.py` with no CLI (override via MPHDRL_* env vars).
 DEFAULT_TRAINING_EPOCHS = 100
 DEFAULT_SAVE_EVERY = 10
 DEFAULT_DEVICE = "auto"
-DEFAULT_SRRL_TUNING_DIR = os.path.join("artifacts", "srrl_tuning")
-SRRL_HP_KEYS_SKIP_FROM_FILE = frozenset({"cls_warmup_epochs"})
+DEFAULT_MPHDRL_TUNING_DIR = os.path.join("artifacts", "mphdrl_tuning")
 
 
 def set_global_seed(seed: int | None):
@@ -87,26 +84,26 @@ def set_global_seed(seed: int | None):
         torch.backends.cudnn.benchmark = False
 
 
-def load_best_srrl_params_from_tuning(tuning_dir: str) -> bool:
+def load_best_mphdrl_params_from_tuning(tuning_dir: str) -> bool:
     """
-    Merge the best status=ok row (max utility) from tuning trials.csv into SRRL_HPARAMS.
+    Merge the best status=ok row (max utility) from tuning trials.csv into HPARAMS.
     Returns True if hyperparameters were loaded from disk.
     """
     trials_csv = os.path.join(tuning_dir, "trials.csv")
     if not os.path.isfile(trials_csv):
-        print(f"SRRL tuning: no {trials_csv} — using defaults from SRRL.py")
+        print(f"MPHDRL tuning: no {trials_csv} — using defaults from MPHDRL.py")
         return False
     try:
         df = pd.read_csv(trials_csv)
     except Exception as e:
-        print(f"SRRL tuning: could not read {trials_csv}: {e}")
+        print(f"MPHDRL tuning: could not read {trials_csv}: {e}")
         return False
     if df.empty or "status" not in df.columns or "params" not in df.columns:
-        print(f"SRRL tuning: unexpected CSV shape in {trials_csv}")
+        print(f"MPHDRL tuning: unexpected CSV shape in {trials_csv}")
         return False
     ok = df[df["status"] == "ok"].copy()
     if ok.empty:
-        print("SRRL tuning: no status=ok rows — using defaults from SRRL.py")
+        print("MPHDRL tuning: no status=ok rows — using defaults from MPHDRL.py")
         return False
     if "utility" in ok.columns:
         ok["utility"] = pd.to_numeric(ok["utility"], errors="coerce")
@@ -119,83 +116,83 @@ def load_best_srrl_params_from_tuning(tuning_dir: str) -> bool:
         raw_p = row["params"]
         params = json.loads(raw_p) if isinstance(raw_p, str) else dict(raw_p)
     except Exception as e:
-        print(f"SRRL tuning: could not parse params JSON: {e}")
+        print(f"MPHDRL tuning: could not parse params JSON: {e}")
         return False
-    int_keys = {"n_step", "batch_size", "var_window", "cls_warmup_epochs"}
-    for key, val in params.items():
-        if key in SRRL_HP_KEYS_SKIP_FROM_FILE:
-            continue
-        if key not in SRRL_HPARAMS:
-            continue
-        if key in int_keys:
-            SRRL_HPARAMS[key] = int(round(float(val)))
-        else:
-            SRRL_HPARAMS[key] = float(val) if isinstance(SRRL_HPARAMS[key], (int, float)) else val
-    if SRRL_HPARAMS["sigma_explore_min"] > SRRL_HPARAMS["sigma_explore"]:
-        SRRL_HPARAMS["sigma_explore_min"] = SRRL_HPARAMS["sigma_explore"]
+    merge_mphdrl_params_dict(params)
     tid = row.get("trial_id", "?")
     util = float(row["utility"]) if "utility" in row else float("nan")
-    print(f"SRRL tuning: applied best trial_id={tid} utility={util:.6f} from {trials_csv}")
+    print(f"MPHDRL tuning: applied best trial_id={tid} utility={util:.6f} from {trials_csv}")
     return True
 
 
-def merge_srrl_params_dict(params: dict) -> None:
-    """Merge tuning-style hyperparameter keys into SRRL_HPARAMS in place."""
-    int_keys = {"n_step", "batch_size", "var_window", "cls_warmup_epochs"}
+def merge_mphdrl_params_dict(params: dict) -> None:
+    """Merge tuning-style hyperparameter keys into MPHDRL.HPARAMS in place."""
+    int_keys = {
+        "n_step",
+        "batch_size",
+        "var_window",
+        "delay_c",
+        "delay_b",
+        "H_srl",
+        "N_w",
+        "TW",
+        "stop_loss_embed_dim",
+    }
     for key, val in params.items():
-        if key in SRRL_HP_KEYS_SKIP_FROM_FILE:
+        if key not in HPARAMS:
             continue
-        if key not in SRRL_HPARAMS:
+        cur = HPARAMS[key]
+        if isinstance(cur, list):
+            if isinstance(val, list):
+                HPARAMS[key] = val
             continue
         if key in int_keys:
-            SRRL_HPARAMS[key] = int(round(float(val)))
-        else:
-            SRRL_HPARAMS[key] = float(val) if isinstance(SRRL_HPARAMS[key], (int, float)) else val
-    if SRRL_HPARAMS["sigma_explore_min"] > SRRL_HPARAMS["sigma_explore"]:
-        SRRL_HPARAMS["sigma_explore_min"] = SRRL_HPARAMS["sigma_explore"]
+            HPARAMS[key] = int(round(float(val)))
+        elif isinstance(cur, (int, float)):
+            HPARAMS[key] = float(val)
 
 
-def merge_srrl_hp_patch_from_env() -> None:
-    """If SRRL_HP_PATCH points to a JSON file, merge into SRRL_HPARAMS (used by srrl_tuning trials)."""
-    path = os.environ.get("SRRL_HP_PATCH", "").strip()
+def merge_mphdrl_hp_patch_from_env() -> None:
+    """If MPHDRL_HP_PATCH points to a JSON file, merge into HPARAMS (used by mphdrl_tuning trials)."""
+    path = os.environ.get("MPHDRL_HP_PATCH", "").strip()
     if not path or not os.path.isfile(path):
         return
     try:
         with open(path, encoding="utf-8") as f:
             patch = json.load(f)
     except Exception as e:
-        print(f"SRRL_HP_PATCH: failed to load {path}: {e}")
+        print(f"MPHDRL_HP_PATCH: failed to load {path}: {e}")
         return
     if isinstance(patch, dict):
-        merge_srrl_params_dict(patch)
-        print(f"SRRL: merged hyperparameter patch from {path}")
+        merge_mphdrl_params_dict(patch)
+        print(f"MPHDRL: merged hyperparameter patch from {path}")
 
 
 def load_training_config() -> SimpleNamespace:
-    """No CLI: defaults below; srrl_tuning sets SRRL_* environment variables."""
-    raw_epochs = os.environ.get("SRRL_TRAIN_EPOCHS", "").strip()
+    """No CLI: defaults below; mphdrl_tuning sets MPHDRL_* environment variables."""
+    raw_epochs = os.environ.get("MPHDRL_TRAIN_EPOCHS", "").strip()
     epochs = int(raw_epochs) if raw_epochs else DEFAULT_TRAINING_EPOCHS
 
-    raw_save = os.environ.get("SRRL_SAVE_EVERY", "").strip()
+    raw_save = os.environ.get("MPHDRL_SAVE_EVERY", "").strip()
     save_every = int(raw_save) if raw_save else DEFAULT_SAVE_EVERY
 
-    device = os.environ.get("SRRL_DEVICE", "").strip() or DEFAULT_DEVICE
+    device = os.environ.get("MPHDRL_DEVICE", "").strip() or DEFAULT_DEVICE
 
-    tuning_dir = os.environ.get("SRRL_TUNING_DIR", "").strip() or DEFAULT_SRRL_TUNING_DIR
+    tuning_dir = os.environ.get("MPHDRL_TUNING_DIR", "").strip() or DEFAULT_MPHDRL_TUNING_DIR
 
-    seed_raw = os.environ.get("SRRL_SEED", "").strip()
+    seed_raw = os.environ.get("MPHDRL_SEED", "").strip()
     seed = int(seed_raw) if seed_raw else None
 
-    no_amp = os.environ.get("SRRL_NO_AMP", "").strip().lower() in ("1", "true", "yes")
-    no_compile = os.environ.get("SRRL_NO_COMPILE", "").strip().lower() in ("1", "true", "yes")
-    env_diagnostic_no_risk_tax = os.environ.get("SRRL_DIAG_NO_RISK_TAX", "").strip().lower() in (
+    no_amp = os.environ.get("MPHDRL_NO_AMP", "").strip().lower() in ("1", "true", "yes")
+    no_compile = os.environ.get("MPHDRL_NO_COMPILE", "").strip().lower() in ("1", "true", "yes")
+    env_diagnostic_no_risk_tax = os.environ.get("MPHDRL_DIAG_NO_RISK_TAX", "").strip().lower() in (
         "1",
         "true",
         "yes",
     )
 
     return SimpleNamespace(
-        agent="SRRL",
+        agent="MPHDRL",
         epochs=epochs,
         save_every=max(1, save_every),
         device=device,
@@ -209,27 +206,29 @@ def load_training_config() -> SimpleNamespace:
     )
 
 
-def print_srrl_hparams():
+def print_mphdrl_hparams():
     keys = [
         "lr",
         "tau",
         "batch_size",
         "discount_gamma",
         "n_step",
-        "gamma_risk",
+        "sigma_explore",
+        "sigma_smooth",
+        "gamma",
         "risk_lambda",
         "var_window",
         "terminal_utility_weight",
-        "sigma_explore",
-        "sigma_explore_min",
-        "turnover_penalty",
-        "dropout",
-        "weight_decay",
-        "cls_label_smoothing",
+        "per_alpha",
+        "per_beta_start",
+        "per_xi",
+        "zeta",
+        "delay_c",
+        "delay_b",
     ]
-    print("SRRL hyperparameters:")
+    print("MPHDRL hyperparameters:")
     for k in keys:
-        print(f"  {k}: {SRRL_HPARAMS[k]}")
+        print(f"  {k}: {HPARAMS[k]}")
 
 
 def resolve_training_device(preference: str) -> torch.device:
@@ -345,7 +344,7 @@ class BaseTrainer:
 # MPHDRL Trainer
 # ============================================================================
 
-# @register_agent("MPHDRL")
+@register_agent("MPHDRL")
 class MPHDRLTrainer(BaseTrainer):
 
     def __init__(self, args, data):
@@ -1128,7 +1127,7 @@ class SRRLUniformReplay:
         return len(self.buffer)
 
 
-@register_agent("SRRL")
+# @register_agent("SRRL")
 class SRRLTrainer(BaseTrainer):
     """Supervised-RL Hybrid: classification gates DDPG actor for per-pair lever."""
 
@@ -1554,11 +1553,11 @@ def _checkpoint_rank_key(ckpt_path: str):
 
 
 def _build_eval_model(agent_name: str, ckpt_path: str, f_dim: int, n_pairs: int, n_tickers: int, M, device: torch.device):
-    # if agent_name == "MPHDRL":
-    #     model = MPHDRLTrader(f_dim, n_pairs, n_tickers, M, device=str(device))
-    #     model.load_checkpoint(ckpt_path)
-    #     model.eval()
-    #     return model
+    if agent_name == "MPHDRL":
+        model = MPHDRLTrader(f_dim, n_pairs, n_tickers, M, device=str(device))
+        model.load_checkpoint(ckpt_path)
+        model.eval()
+        return model
     # if agent_name == "Benchmark":
     #     try:
     #         raw_bench = torch.load(ckpt_path, map_location=str(device), weights_only=False)
@@ -1569,11 +1568,11 @@ def _build_eval_model(agent_name: str, ckpt_path: str, f_dim: int, n_pairs: int,
     #     model.load_checkpoint(ckpt_path)
     #     model.eval()
     #     return model
-    if agent_name == "SRRL":
-        model = SRRLTrader(f_dim, n_pairs, n_tickers, M, device=str(device))
-        model.load_checkpoint(ckpt_path)
-        model.eval()
-        return model
+    # if agent_name == "SRRL":
+    #     model = SRRLTrader(f_dim, n_pairs, n_tickers, M, device=str(device))
+    #     model.load_checkpoint(ckpt_path)
+    #     model.eval()
+    #     return model
     raise ValueError(f"Unsupported agent_name: {agent_name}")
 
 
@@ -1626,22 +1625,22 @@ def evaluate_and_promote_best_insample_checkpoint(
     for ckpt in sorted(ckpts, key=lambda p: (_checkpoint_rank_key(p), p)):
         try:
             model = _build_eval_model(agent_name, ckpt, f_dim, n_pairs, n_tickers, M, device)
-            # if agent_name == "MPHDRL":
-            #     weights_by_date = get_mphdrl_weights_by_env(
-            #         model,
-            #         meta_train,
-            #         x_train,
-            #         y_train,
-            #         pairs,
-            #         tickers,
-            #         ticker_to_idx,
-            #         spread_wide=spread_wide,
-            #         split="train",
-            #     )
-            # else:
-            weights_by_date = get_all_weights_by_date(
-                model, meta_train, x_train, pair_key_to_idx, n_pairs, f_dim, train_dates
-            )
+            if agent_name == "MPHDRL":
+                weights_by_date = get_mphdrl_weights_by_env(
+                    model,
+                    meta_train,
+                    x_train,
+                    y_train,
+                    pairs,
+                    tickers,
+                    ticker_to_idx,
+                    spread_wide=spread_wide,
+                    split="train",
+                )
+            else:
+                weights_by_date = get_all_weights_by_date(
+                    model, meta_train, x_train, pair_key_to_idx, n_pairs, f_dim, train_dates
+                )
             df_bt = run_strategy_backtest(f"{agent_name} in-sample", weights_by_date, price_wide, tickers, valid_dates)
             m = summarize_backtest_dataframe(df_bt, gamma=0.5)
             rows.append(
@@ -1683,7 +1682,7 @@ def evaluate_and_promote_best_insample_checkpoint(
     if os.path.abspath(best_ckpt) != os.path.abspath(final_path):
         shutil.copy2(best_ckpt, final_path)
 
-    artifact_dir = os.path.join("artifacts", "insample_selection")
+    artifact_dir = os.path.join("artifacts", "insample_selection", agent_name.lower())
     os.makedirs(artifact_dir, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = os.path.join(artifact_dir, f"{agent_name.lower()}_checkpoint_scores_{stamp}.csv")
@@ -1721,8 +1720,8 @@ def evaluate_and_promote_best_insample_checkpoint(
 def main():
     args = load_training_config()
     set_global_seed(args.seed)
-    load_best_srrl_params_from_tuning(args.tuning_dir)
-    merge_srrl_hp_patch_from_env()
+    load_best_mphdrl_params_from_tuning(args.tuning_dir)
+    merge_mphdrl_hp_patch_from_env()
 
     resolved = resolve_training_device(args.device)
     configure_accelerator(resolved)
@@ -1730,8 +1729,8 @@ def main():
 
     print("=" * 60)
     print(f"Agent: {args.agent}")
-    print(f"Epochs: {args.epochs} (classification first half, RL second half)")
-    print(f"Device: {resolved} (SRRL_DEVICE={args.device!r})")
+    print(f"Epochs: {args.epochs}")
+    print(f"Device: {resolved} (MPHDRL_DEVICE={args.device!r})")
     if resolved.type == "cuda":
         print(
             f"Speed opts: AMP={'off' if args.no_amp else 'on (bf16 or fp16+scaler)'}, "
@@ -1742,7 +1741,7 @@ def main():
     if args.seed is not None:
         print(f"Seed: {args.seed}")
     print("=" * 60)
-    print_srrl_hparams()
+    print_mphdrl_hparams()
 
     print("\nChecking data readiness...")
     ok, data = check_data_readiness()
