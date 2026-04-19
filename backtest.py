@@ -30,6 +30,7 @@ from MPHDRL import (
     build_pair_ticker_mapping,
 )
 from benchmark import BENCHMARK_MODEL_DIR, H_BENCHMARK, BenchmarkDDPG
+from SRRL import SRRL_MODEL_DIR, SRRLTrader
 from traditional import (
     TRADITIONAL_PARAMS_PATH,
     compute_traditional_weights_by_date,
@@ -121,7 +122,14 @@ def load_price_matrix(tickers):
     if not os.path.isfile(raw_path):
         print(f"Missing {raw_path}. Run collection.py first.")
         sys.exit(1)
-    raw = pd.read_csv(raw_path, parse_dates=["Date"])
+    raw = pd.read_csv(
+        raw_path,
+        parse_dates=["Date"],
+        usecols=["Date", "Ticker", "Close"],
+    )
+    need = set(tickers)
+    raw = raw.loc[raw["Ticker"].isin(need), ["Date", "Ticker", "Close"]]
+    raw = raw.sort_values(["Date", "Ticker"]).drop_duplicates(["Date", "Ticker"], keep="last")
     wide = raw.pivot(index="Date", columns="Ticker", values="Close").sort_index()
     missing_t = [t for t in tickers if t not in wide.columns]
     if missing_t:
@@ -421,7 +429,7 @@ def print_zero_weight_diagnostics(label, weights_by_date):
 
 def parse_args():
     p = argparse.ArgumentParser(description="Walk-forward backtest for RL Pairs Trading")
-    p.add_argument("--device", type=str, default="cpu", help="torch device (default: cpu)")
+    p.add_argument("--device", type=str, default="cpu", help="torch device: cpu, cuda, mps, or auto (default: cpu)")
     p.add_argument(
         "--mphdrl-checkpoint", type=str, default=None, dest="mphdrl_ckpt",
         help="MPHDRL .pt checkpoint (default: models/MPHDRL/final.pt or checkpoint.pt)",
@@ -429,6 +437,10 @@ def parse_args():
     p.add_argument(
         "--benchmark-checkpoint", type=str, default=None, dest="bench_ckpt",
         help="Benchmark .pt checkpoint (default: models/benchmark/final.pt or checkpoint.pt)",
+    )
+    p.add_argument(
+        "--srrl-checkpoint", type=str, default=None, dest="srrl_ckpt",
+        help="SRRL .pt checkpoint (default: models/srrl/final.pt or checkpoint.pt)",
     )
     p.add_argument(
         "--traditional-params",
@@ -442,10 +454,21 @@ def parse_args():
     return p.parse_args()
 
 
+def resolve_backtest_device(preference: str) -> torch.device:
+    name = (preference or "cpu").strip().lower()
+    if name == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    return torch.device(name)
+
+
 def main():
     args = parse_args()
     os.makedirs(BACKTEST_DIR, exist_ok=True)
-    dev = torch.device(args.device)
+    dev = resolve_backtest_device(args.device)
 
     print("=" * 60)
     print("Walk-Forward Backtest")
@@ -496,8 +519,19 @@ def main():
     bench_model.load_checkpoint(bench_ckpt)
     bench_model.eval()
 
+    srrl_ckpt = args.srrl_ckpt or _default_ckpt(SRRL_MODEL_DIR)
+    srrl_model = None
+    if srrl_ckpt is not None and os.path.isfile(srrl_ckpt):
+        srrl_model = SRRLTrader(F_dim, n_pairs, n_tickers, M, device=str(dev))
+        srrl_model.load_checkpoint(srrl_ckpt)
+        srrl_model.eval()
+    else:
+        print(f"  INFO: No SRRL checkpoint found under {SRRL_MODEL_DIR}. Skipping SRRL backtest.")
+
     print(f"\nMPHDRL checkpoint:    {os.path.abspath(mphdrl_ckpt)}")
     print(f"Benchmark checkpoint: {os.path.abspath(bench_ckpt)}")
+    if srrl_model is not None:
+        print(f"SRRL checkpoint:      {os.path.abspath(srrl_ckpt)}")
     print(f"Initial cash: {INITIAL_CASH:,.0f} INR")
     print(f"Txn cost: {TXN_COST_RATE*100:.5f}%  |  Short cost: {SHORT_COST_ANNUAL*100:.2f}% ann.")
     print(f"STCG: {STCG_RATE*100:.0f}%  |  LTCG: {LTCG_RATE*100:.1f}%")
@@ -526,6 +560,14 @@ def main():
     print_zero_weight_diagnostics("MPHDRL", mphdrl_weights)
     print_zero_weight_diagnostics("Benchmark", bench_weights)
 
+    srrl_weights: dict = {}
+    if srrl_model is not None:
+        srrl_weights = get_all_test_weights(
+            srrl_model, meta_test, x_test, pairs, pair_key_to_idx, n_pairs, F_dim, test_dates,
+        )
+        print(f"  SRRL dates with weights: {len(srrl_weights)}")
+        print_zero_weight_diagnostics("SRRL", srrl_weights)
+
     trad_weights: dict = {}
     hedge_path = os.path.join("data", "pickle", "hedge_ratios.pkl")
     if os.path.isfile(hedge_path) and os.path.isfile(spread_raw_path):
@@ -549,12 +591,14 @@ def main():
     df_trad = run_strategy_backtest(
         "Traditional pairs", trad_weights, price_wide, tickers, valid_dates,
     )
+    df_srrl = run_strategy_backtest("SRRL", srrl_weights, price_wide, tickers, valid_dates)
 
     # --- Export ---
     for name, df in [
         ("mphdrl", df_mphdrl),
         ("benchmark", df_bench),
         ("traditional", df_trad),
+        ("srrl", df_srrl),
     ]:
         out_path = os.path.join(BACKTEST_DIR, f"{name}.csv")
         df.to_csv(out_path, index=False)
@@ -568,6 +612,7 @@ def main():
         ("MPHDRL", df_mphdrl),
         ("Benchmark RL", df_bench),
         ("Traditional pairs", df_trad),
+        ("SRRL", df_srrl),
     ]:
         if df.empty:
             print(f"  {label}: no data")

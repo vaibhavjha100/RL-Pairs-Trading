@@ -470,6 +470,111 @@ def run_part2_spread_pipeline():
     print(f"Saved {pca_clustered_path}")
     print(f"Saved {sequence_meta_path}")
 
+def _rolling_z_preproc(spread: np.ndarray, L: int) -> np.ndarray:
+    """Causal rolling z-score: z[i] = (spread[i] - mu) / sig using spread[i-L:i]."""
+    n = len(spread)
+    z = np.full(n, np.nan, dtype=np.float64)
+    if n <= L:
+        return z
+    s = np.asarray(spread, dtype=np.float64)
+    c = np.concatenate([[0.0], np.cumsum(s)])
+    c2 = np.concatenate([[0.0], np.cumsum(s * s)])
+    idx = np.arange(L, n, dtype=np.int64)
+    sum_x = c[idx] - c[idx - L]
+    sum_xx = c2[idx] - c2[idx - L]
+    mu = sum_x / L
+    den = max(L - 1, 1)
+    var = np.maximum((sum_xx - sum_x * sum_x / L) / den, 0.0)
+    sig = np.sqrt(np.maximum(var, 1e-16))
+    z[idx] = (s[idx] - mu) / sig
+    return z
+
+
+def build_binary_reversion_labels(
+    spread_raw_path: str,
+    pairs: list,
+    lookback: int = 60,
+    horizon: int = 32,
+    z_threshold: float = 1.0,
+) -> pd.DataFrame:
+    """
+    For each (pair, date), y_bin32 = 1 if the spread is deviated (|z| >= threshold)
+    and z crosses zero within the next `horizon` bars; else 0.
+    """
+    sp = pd.read_csv(spread_raw_path, parse_dates=["Date"])
+    if "Unnamed: 0" in sp.columns:
+        sp = sp.drop(columns=["Unnamed: 0"])
+    pivot = sp.pivot(index="Date", columns="Pair", values="spread").sort_index()
+    pair_keys = [f"{a}|{b}" for a, b in pairs]
+
+    rows = []
+    for pk in pair_keys:
+        if pk not in pivot.columns:
+            continue
+        vals = pivot[pk].values.astype(np.float64)
+        dates = pivot.index
+        z = _rolling_z_preproc(vals, lookback)
+        n = len(z)
+        for i in range(n):
+            if not np.isfinite(z[i]):
+                rows.append((pk, dates[i], 0))
+                continue
+            if abs(z[i]) < z_threshold:
+                rows.append((pk, dates[i], 0))
+                continue
+            sign_t = 1.0 if z[i] > 0 else -1.0
+            reverted = 0
+            for j in range(i + 1, min(i + 1 + horizon, n)):
+                if np.isfinite(z[j]) and z[j] * sign_t <= 0.0:
+                    reverted = 1
+                    break
+            rows.append((pk, dates[i], reverted))
+
+    df = pd.DataFrame(rows, columns=["Pair", "target_date", "y_bin32"])
+    df["target_date"] = pd.to_datetime(df["target_date"])
+    return df
+
+
+def run_part2b_binary_labels():
+    """Build binary mean-reversion labels aligned with existing X_train/X_test."""
+    print("\nPart 2b: Building binary mean-reversion labels (horizon=32)...")
+    pickle_dir = os.path.join("data", "pickle")
+    spread_dir = os.path.join("data", "spread")
+    spread_raw_path = os.path.join(spread_dir, "raw.csv")
+    pairs_path = os.path.join(pickle_dir, "cointegrated_pairs.pkl")
+    meta_path = os.path.join(spread_dir, "sequence_xy.csv")
+
+    for p in [spread_raw_path, pairs_path, meta_path]:
+        if not os.path.isfile(p):
+            print(f"  SKIP Part 2b: missing {p}")
+            return
+
+    with open(pairs_path, "rb") as f:
+        pairs = pickle.load(f)
+    meta_df = pd.read_csv(meta_path, parse_dates=["target_date"])
+    if "Unnamed: 0" in meta_df.columns:
+        meta_df = meta_df.drop(columns=["Unnamed: 0"])
+
+    labels = build_binary_reversion_labels(spread_raw_path, pairs)
+    merged = meta_df.merge(labels, on=["Pair", "target_date"], how="left")
+    merged["y_bin32"] = merged["y_bin32"].fillna(0).astype(np.int64)
+
+    split_date = pd.to_datetime("2024-01-01")
+    train_mask = merged["target_date"] < split_date
+    y_bin32_train = merged.loc[train_mask, "y_bin32"].values.astype(np.int64)
+    y_bin32_test = merged.loc[~train_mask, "y_bin32"].values.astype(np.int64)
+
+    with open(os.path.join(pickle_dir, "spread_y_bin32_train.pkl"), "wb") as f:
+        pickle.dump(y_bin32_train, f)
+    with open(os.path.join(pickle_dir, "spread_y_bin32_test.pkl"), "wb") as f:
+        pickle.dump(y_bin32_test, f)
+
+    base_rate = float(y_bin32_train.mean()) if len(y_bin32_train) > 0 else 0.0
+    print(f"  Train samples: {len(y_bin32_train)}  |  positive: {y_bin32_train.sum()}  |  base_rate: {base_rate:.4f}")
+    print(f"  Test  samples: {len(y_bin32_test)}  |  positive: {y_bin32_test.sum()}")
+    print(f"  Saved spread_y_bin32_train.pkl, spread_y_bin32_test.pkl")
+
+
 def main():
     print("Part 1: Loading trading raw data...")
     trading_dir = os.path.join('data', 'trading')
@@ -564,6 +669,7 @@ def main():
     spread_raw_path = os.path.join("data", "spread", "raw.csv")
     if os.path.exists(spread_raw_path):
         run_part2_spread_pipeline()
+        run_part2b_binary_labels()
     else:
         print(f"\nPart 2 (Spread) skipped: '{spread_raw_path}' not found.")
 

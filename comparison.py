@@ -54,6 +54,7 @@ STRATEGY_FILES = (
     ("MPHDRL", "mphdrl.csv"),
     ("Benchmark RL", "benchmark.csv"),
     ("Traditional pairs", "traditional.csv"),
+    ("SRRL", "srrl.csv"),
 )
 
 
@@ -256,24 +257,27 @@ def summarize(df: pd.DataFrame, name: str) -> dict[str, Any]:
     }
 
 
-def run_wilcoxon_mphdrl_greater(
-    u_mph: pd.Series,
-    u_bench: pd.Series,
-    label_bench: str,
+def run_wilcoxon_paired(
+    u_a: pd.Series,
+    u_b: pd.Series,
+    label_a: str,
+    label_b: str,
 ) -> dict[str, Any]:
-    """Paired differences MPHDRL - bench; H1: median > 0."""
-    j = pd.DataFrame({"mph": u_mph, "bench": u_bench}).dropna()
+    """Paired Wilcoxon signed-rank: H1 median(u_a - u_b) > 0."""
+    j = pd.DataFrame({"a": u_a, "b": u_b}).dropna()
     if len(j) < 3:
         return {
-            "benchmark": label_bench,
+            "strategy_a": label_a,
+            "benchmark": label_b,
             "n_pairs": int(len(j)),
             "error": "insufficient paired observations (need >= 3)",
         }
-    d = (j["mph"] - j["bench"]).values.astype(float)
+    d = (j["a"] - j["b"]).values.astype(float)
     d = d[np.isfinite(d)]
     if d.size < 3:
         return {
-            "benchmark": label_bench,
+            "strategy_a": label_a,
+            "benchmark": label_b,
             "n_pairs": int(d.size),
             "error": "insufficient finite differences",
         }
@@ -284,17 +288,19 @@ def run_wilcoxon_mphdrl_greater(
             res = wilcoxon(d, alternative="greater", zero_method="wilcox")
     except ValueError as e:
         return {
-            "benchmark": label_bench,
+            "strategy_a": label_a,
+            "benchmark": label_b,
             "n_pairs": int(d.size),
             "error": str(e),
         }
     stat = res.statistic
     pval = res.pvalue
     return {
-        "benchmark": label_bench,
+        "strategy_a": label_a,
+        "benchmark": label_b,
         "test": "Wilcoxon signed-rank",
         "pairing": "paired_calendar_dates",
-        "difference": "U_MPHDRL(t) - U_benchmark(t)",
+        "difference": f"U_{label_a}(t) - U_{label_b}(t)",
         "n_pairs": int(d.size),
         "alternative": "greater",
         "zero_method": "wilcox",
@@ -368,26 +374,22 @@ def build_report(
             f"{s['total_costs_pct_initial_cash']:>7.3f}% {s['costs_bps_per_year_of_mean_gross_pv']:>10.1f}"
         )
     lines.append("")
-    lines.append("--- Hypothesis tests: median daily rolling utility (MPHDRL vs benchmark) ---")
+    lines.append("--- Hypothesis tests: median daily rolling utility (paired Wilcoxon) ---")
     lines.append(utility_definition_text(window, gamma))
     lines.append("")
-    lines.append("Specification (same for each benchmark below):")
+    lines.append("Specification (same for each test below):")
     lines.append("  Procedure : scipy.stats.wilcoxon (paired Wilcoxon signed-rank)")
     lines.append("  Pairing   : one observation per common calendar date t (inner join on date)")
-    lines.append(
-        "  Difference: d_t = U_MPHDRL(t) - U_benchmark(t), net rolling utility as defined above"
-    )
-    lines.append("  Alternative: 'greater' (one-tailed test on d_t)")
+    lines.append("  Alternative: 'greater' (one-tailed test on d_t = U_A(t) - U_B(t))")
     lines.append("  Zeros     : zero_method='wilcox' (zeros excluded from ranking per Wilcoxon)")
     lines.append(f"  Significance level: alpha = {alpha:g} (reject H0 if p-value < alpha)")
     lines.append("")
-    lines.append("Hypotheses (each benchmark block):")
-    lines.append("  H0: median(d_t) <= 0   (MPHDRL not greater than benchmark on median daily utility)")
-    lines.append("  H1: median(d_t) > 0    (MPHDRL greater than benchmark on median daily utility)")
-    lines.append("")
     for w in wilcox_rows:
+        strat_a = w.get("strategy_a", "?")
         bench = w.get("benchmark", "?")
-        lines.append(f"  [{bench}]")
+        lines.append(f"  [{strat_a} vs {bench}]")
+        lines.append(f"    H0: median(U_{strat_a} - U_{bench}) <= 0")
+        lines.append(f"    H1: median(U_{strat_a} - U_{bench}) > 0")
         if "error" in w:
             lines.append(f"    Status   : not run — {w['error']}")
             lines.append(f"    n (pairs): {w.get('n_pairs', 0)}")
@@ -457,36 +459,64 @@ def main() -> None:
             except OSError:
                 print(f"Loaded {name}: {os.path.abspath(path)}")
 
-    if not all(s.get("ok") for s in summaries):
-        print("All three backtest CSVs are required. Run:  python backtest.py", file=sys.stderr)
+    ok_names = [s["strategy"] for s in summaries if s.get("ok")]
+    if len(ok_names) < 2:
+        print(
+            f"Need at least 2 strategies with valid CSVs for comparison. Found: {ok_names}. "
+            "Run:  python backtest.py",
+            file=sys.stderr,
+        )
         sys.exit(1)
+    missing_names = [s["strategy"] for s in summaries if not s.get("ok")]
+    if missing_names:
+        print(f"  Skipping strategies with missing/invalid CSVs: {missing_names}", file=sys.stderr)
 
-    df_mph = loaded["MPHDRL"].sort_values("date").reset_index(drop=True)
-    df_bench = loaded["Benchmark RL"].sort_values("date").reset_index(drop=True)
-    df_trad = loaded["Traditional pairs"].sort_values("date").reset_index(drop=True)
+    rolling_frames: dict[str, pd.DataFrame] = {}
+    for name in ok_names:
+        df_s = loaded[name].sort_values("date").reset_index(drop=True)
+        udf = rolling_daily_net_utility(df_s, window, gamma).rename(
+            columns={"rolling_u": f"u_{name}"}
+        )
+        rolling_frames[name] = udf
 
-    u_mph = rolling_daily_net_utility(df_mph, window, gamma).rename(columns={"rolling_u": "u_mph"})
-    u_bench = rolling_daily_net_utility(df_bench, window, gamma).rename(
-        columns={"rolling_u": "u_bench"}
-    )
-    u_trad = rolling_daily_net_utility(df_trad, window, gamma).rename(columns={"rolling_u": "u_trad"})
-
-    j = u_mph.merge(u_bench, on="date", how="inner").merge(u_trad, on="date", how="inner")
-    if j.empty:
+    j = None
+    for name, udf in rolling_frames.items():
+        if j is None:
+            j = udf
+        else:
+            j = j.merge(udf, on="date", how="inner")
+    if j is None or j.empty:
         print(
             "Error: no overlapping dates after merging rolling utilities. Check date formats in CSVs.",
             file=sys.stderr,
         )
         sys.exit(1)
     dates = j["date"].values
-    ser_mph = pd.Series(j["u_mph"].values, index=dates)
-    ser_bench = pd.Series(j["u_bench"].values, index=dates)
-    ser_trad = pd.Series(j["u_trad"].values, index=dates)
+    util_series: dict[str, pd.Series] = {}
+    for name in ok_names:
+        col = f"u_{name}"
+        if col in j.columns:
+            util_series[name] = pd.Series(j[col].values, index=dates)
 
-    wilcox_rows = [
-        run_wilcoxon_mphdrl_greater(ser_mph, ser_bench, "Benchmark RL"),
-        run_wilcoxon_mphdrl_greater(ser_mph, ser_trad, "Traditional pairs"),
-    ]
+    wilcox_rows: list[dict[str, Any]] = []
+    if "MPHDRL" in util_series:
+        if "Benchmark RL" in util_series:
+            wilcox_rows.append(
+                run_wilcoxon_paired(util_series["MPHDRL"], util_series["Benchmark RL"], "MPHDRL", "Benchmark RL")
+            )
+        if "Traditional pairs" in util_series:
+            wilcox_rows.append(
+                run_wilcoxon_paired(util_series["MPHDRL"], util_series["Traditional pairs"], "MPHDRL", "Traditional pairs")
+            )
+    if "SRRL" in util_series:
+        if "Traditional pairs" in util_series:
+            wilcox_rows.append(
+                run_wilcoxon_paired(util_series["SRRL"], util_series["Traditional pairs"], "SRRL", "Traditional pairs")
+            )
+        if "MPHDRL" in util_series:
+            wilcox_rows.append(
+                run_wilcoxon_paired(util_series["SRRL"], util_series["MPHDRL"], "SRRL", "MPHDRL")
+            )
 
     tests_for_json: list[dict[str, Any]] = []
     for w in wilcox_rows:
@@ -508,13 +538,13 @@ def main() -> None:
         "window": window,
         "significance_alpha": alpha,
         "hypotheses": {
-            "H0": "median(U_MPHDRL - U_benchmark) <= 0",
-            "H1": "median(U_MPHDRL - U_benchmark) > 0",
+            "H0": "median(U_A - U_B) <= 0",
+            "H1": "median(U_A - U_B) > 0",
         },
         "test_specification": {
             "procedure": "scipy.stats.wilcoxon",
             "paired_on": "date",
-            "difference": "U_MPHDRL(t) - U_benchmark(t)",
+            "difference": "U_A(t) - U_B(t)",
             "alternative": "greater",
             "zero_method": "wilcox",
         },
