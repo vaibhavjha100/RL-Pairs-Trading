@@ -1140,7 +1140,11 @@ class SRRLTrainer(BaseTrainer):
             diagnostic_no_risk_tax=_diag,
         )
         self.n_step = SRRL_HPARAMS["n_step"]
-        self.cls_warmup_epochs = max(0, int(SRRL_HPARAMS.get("cls_warmup_epochs", 0)))
+        K = max(0, int(SRRL_HPARAMS.get("cls_warmup_epochs", 0)))
+        self.cls_warmup_epochs = K
+        # K>0: K epochs classification-only, then K epochs RL-only (total 2*K). K==0: RL only for args.epochs.
+        if K > 0:
+            self.epochs = 2 * K
         self._cls_frozen_for_rl = False
         self._episode_diag = {}
 
@@ -1186,6 +1190,15 @@ class SRRLTrainer(BaseTrainer):
         sigma_lo = float(SRRL_HPARAMS.get("sigma_explore_min", sigma_hi))
         if self.epochs <= 1:
             return sigma_lo
+        K = self.cls_warmup_epochs
+        if K > 0:
+            # Anneal exploration across the RL half only; hold max sigma during cls rollouts.
+            if epoch <= K:
+                return sigma_hi
+            rl_epoch = epoch - K
+            rl_span = max(1, K - 1)
+            frac = float(max(0, rl_epoch - 1)) / float(rl_span)
+            return sigma_hi + (sigma_lo - sigma_hi) * frac
         frac = float(max(0, epoch - 1)) / float(max(1, self.epochs - 1))
         return sigma_hi + (sigma_lo - sigma_hi) * frac
 
@@ -1412,13 +1425,15 @@ class SRRLTrainer(BaseTrainer):
 
     def train(self):
         print(f"\n{'=' * 60}")
-        print(f"Training SRRL agent for {self.epochs} epochs")
-        print(f"Device: {self.device} ({self.device.type}) | Pairs: {self.n_pairs}")
-        if self.cls_warmup_epochs > 0:
+        K = self.cls_warmup_epochs
+        if K > 0:
             print(
-                f"cls_warmup_epochs={self.cls_warmup_epochs} "
-                f"(classification-only, then RL-only training)"
+                f"Training SRRL agent for {self.epochs} epochs total "
+                f"({K} cls-only, then {K} RL-only); --epochs ({self.args.epochs}) ignored while K>0"
             )
+        else:
+            print(f"Training SRRL agent for {self.epochs} epochs (RL-only)")
+        print(f"Device: {self.device} ({self.device.type}) | Pairs: {self.n_pairs}")
         print(f"{'=' * 60}\n")
 
         for epoch in range(1, self.epochs + 1):
@@ -1706,7 +1721,10 @@ def parse_args():
         type=int,
         default=None,
         dest="srrl_cls_warmup_epochs",
-        help="SRRL: train only srl_cls + cls_head (BCE) for first N epochs, then joint RL (default: 0).",
+        help=(
+            "SRRL: K>0 runs K epochs classification-only then K epochs RL-only (total 2K; --epochs ignored). "
+            "0 = RL-only for full --epochs."
+        ),
     )
     parser.add_argument(
         "--srrl-dropout",
@@ -1737,11 +1755,8 @@ def main():
     set_global_seed(args.seed)
     load_best_srrl_params_from_tuning(args.srrl_tuning_dir)
     apply_srrl_overrides(args)
-    cw = max(
-        0,
-        min(int(SRRL_HPARAMS.get("cls_warmup_epochs", 0)), max(0, args.epochs - 1)),
-    )
-    SRRL_HPARAMS["cls_warmup_epochs"] = cw
+    # SRRLTrainer uses cls_warmup_epochs as K: K epochs cls + K epochs RL (total 2K). No cap vs --epochs.
+    SRRL_HPARAMS["cls_warmup_epochs"] = max(0, int(SRRL_HPARAMS.get("cls_warmup_epochs", 0)))
 
     resolved = resolve_training_device(args.device)
     configure_accelerator(resolved)
@@ -1783,7 +1798,7 @@ def main():
             agent_name,
             trainer.model_dir,
             resolved,
-            trained_epochs=args.epochs,
+            trained_epochs=getattr(trainer, "epochs", args.epochs),
             save_every=args.save_every,
         )
 

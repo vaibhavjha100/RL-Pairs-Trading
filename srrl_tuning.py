@@ -85,9 +85,11 @@ def stable_id(stage: str, params: Dict[str, float], seed: int) -> str:
 
 
 def cap_cls_warmup_epochs(params: Dict[str, float], epochs: int) -> Dict[str, float]:
-    """Keep cls warm-up within [0, epochs-1] so trial id matches training CLI."""
+    """Cap K so training total 2*K fits trial budget (training.py runs K cls + K RL epochs)."""
     out = dict(params)
-    cw = max(0, min(int(round(float(out.get("cls_warmup_epochs", 0)))), max(0, epochs - 1)))
+    cw_raw = int(round(float(out.get("cls_warmup_epochs", 0))))
+    max_k = epochs // 2  # SRRLTrainer uses total epochs = 2*K when K > 0
+    cw = max(0, min(cw_raw, max_k))
     out["cls_warmup_epochs"] = cw
     return out
 
