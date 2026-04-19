@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import hashlib
 import json
 import math
@@ -22,7 +23,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -85,13 +86,8 @@ def stable_id(stage: str, params: Dict[str, float], seed: int) -> str:
 
 
 def cap_cls_warmup_epochs(params: Dict[str, float], epochs: int) -> Dict[str, float]:
-    """Cap K so training total 2*K fits trial budget (training.py runs K cls + K RL epochs)."""
-    out = dict(params)
-    cw_raw = int(round(float(out.get("cls_warmup_epochs", 0))))
-    max_k = epochs // 2  # SRRLTrainer uses total epochs = 2*K when K > 0
-    cw = max(0, min(cw_raw, max_k))
-    out["cls_warmup_epochs"] = cw
-    return out
+    """Copy params for trial identity; training.py splits epochs half cls / half RL automatically."""
+    return dict(params)
 
 
 def ensure_dirs(root: Path, outdir: str) -> Dict[str, Path]:
@@ -178,8 +174,13 @@ def parse_last_epoch_metrics(train_output: str) -> Dict[str, float]:
     }
 
 
-def run_cmd(cmd: List[str], cwd: Path) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, cwd=str(cwd), text=True, capture_output=True)
+def run_cmd(
+    cmd: List[str], cwd: Path, env: Optional[Dict[str, str]] = None
+) -> subprocess.CompletedProcess:
+    kw: Dict = dict(cwd=str(cwd), text=True, capture_output=True)
+    if env is not None:
+        kw["env"] = env
+    return subprocess.run(cmd, **kw)
 
 
 def resolve_device(preference: str) -> str:
@@ -225,50 +226,18 @@ def run_trial(
     log_path = paths["logs"] / f"{stage}_{trial_id}.log"
     ckpt_path = paths["ckpt"] / f"{stage}_{trial_id}.pt"
 
-    train_cmd = [
-        pybin,
-        "training.py",
-        "--agent",
-        "SRRL",
-        "--epochs",
-        str(epochs),
-        "--save-every",
-        str(epochs),
-        "--device",
-        device,
-        "--seed",
-        str(seed),
-        "--srrl-lr",
-        str(params["lr"]),
-        "--srrl-tau",
-        str(params["tau"]),
-        "--srrl-n-step",
-        str(int(params["n_step"])),
-        "--srrl-turnover-penalty",
-        str(params["turnover_penalty"]),
-        "--srrl-sigma-explore",
-        str(params["sigma_explore"]),
-        "--srrl-sigma-explore-min",
-        str(params["sigma_explore_min"]),
-    ]
-    if "batch_size" in params:
-        train_cmd += ["--srrl-batch-size", str(int(params["batch_size"]))]
-    if "discount_gamma" in params:
-        train_cmd += ["--srrl-discount-gamma", str(params["discount_gamma"])]
-    if "gamma_risk" in params:
-        train_cmd += ["--srrl-gamma-risk", str(params["gamma_risk"])]
-    if "risk_lambda" in params:
-        train_cmd += ["--srrl-risk-lambda", str(params["risk_lambda"])]
-    if params.get("cls_warmup_epochs", 0) > 0:
-        train_cmd += ["--srrl-cls-warmup-epochs", str(int(params["cls_warmup_epochs"]))]
-    if "dropout" in params:
-        train_cmd += ["--srrl-dropout", str(params["dropout"])]
-    if "weight_decay" in params:
-        train_cmd += ["--srrl-weight-decay", str(params["weight_decay"])]
-    if "cls_label_smoothing" in params:
-        train_cmd += ["--srrl-cls-label-smoothing", str(params["cls_label_smoothing"])]
+    patch_path = paths["base"] / f"srrl_hp_patch_{trial_id}.json"
+    patch_path.write_text(json.dumps(params, sort_keys=True), encoding="utf-8")
+    trial_env = os.environ.copy()
+    trial_env["SRRL_HP_PATCH"] = str(patch_path.resolve())
+    trial_env["SRRL_TRAIN_EPOCHS"] = str(epochs)
+    trial_env["SRRL_SAVE_EVERY"] = str(epochs)
+    trial_env["SRRL_DEVICE"] = device
+    trial_env["SRRL_SEED"] = str(seed)
 
-    train_proc = run_cmd(train_cmd, root)
+    train_cmd = [pybin, "training.py"]
+
+    train_proc = run_cmd(train_cmd, root, env=trial_env)
     log_path.write_text(train_proc.stdout + "\n\nSTDERR:\n" + train_proc.stderr, encoding="utf-8")
     m = parse_last_epoch_metrics(train_proc.stdout)
     if train_proc.returncode != 0:

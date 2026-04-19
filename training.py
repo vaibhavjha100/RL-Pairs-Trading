@@ -1,34 +1,34 @@
 """
 training.py -- SRRL training harness for RL pairs trading.
 
-Default entrypoint trains SRRL only. Best hyperparameters are loaded from the
-tuning output directory (see --srrl-tuning-dir, default artifacts/srrl_tuning/trials.csv),
-then optional CLI --srrl-* flags override.
+Run with no arguments:
+    python training.py
+
+Hyperparameters default from SRRL.py, then optional merge from artifacts/srrl_tuning/trials.csv
+(best trial). Classification trains for the first half of epochs; RL for the remainder
+(e.g. 100 epochs -> 50 cls-only, then 50 RL-only).
+
+Optional environment overrides (for automation / srrl_tuning.py):
+    SRRL_TRAIN_EPOCHS, SRRL_DEVICE, SRRL_SEED, SRRL_SAVE_EVERY, SRRL_TUNING_DIR,
+    SRRL_HP_PATCH (path to JSON hyperparameter patch), SRRL_NO_AMP, SRRL_NO_COMPILE,
+    SRRL_DIAG_NO_RISK_TAX.
 
 Previously also supported (code retained, commented out):
-    - MPHDRL: hybrid HDRL (TD3 critics, DDQN stop-loss, delayed actor + portfolio
-      + auxiliary regression, PER). See multi_pair_hdrl_trader_architecture.md.
-    - Benchmark: plain GRU actor–critic, DDPG-style replay on pair exposures E.
+    - MPHDRL: hybrid HDRL ...
+    - Benchmark: plain GRU actor–critic ...
 
-Usage:
-    python training.py
-    python training.py --epochs 100 --device cuda
-    python training.py --env-diagnostic-no-risk-tax  # diagnostic: no variance/tax/terminal bonus; costs on
-
-On CUDA (default): cudnn benchmark, TF32, fast H2D copies, mixed precision (bfloat16
-if supported else float16 + GradScaler), and torch.compile on forward_step unless
-disabled with --no-amp / --no-compile. Same training schedule (epochs, HPARAMS).
+On CUDA (default): cudnn benchmark, TF32, mixed precision, torch.compile unless disabled.
 """
 
 import contextlib
 import os
 import sys
 import time
-import argparse
 import random
 import pickle
 import json
 import shutil
+from types import SimpleNamespace
 from datetime import datetime
 import numpy as np
 import pandas as pd
@@ -64,6 +64,13 @@ from backtest_core import (
     run_strategy_backtest,
     summarize_backtest_dataframe,
 )
+
+# Defaults when running `python training.py` with no CLI (override via SRRL_* env vars).
+DEFAULT_TRAINING_EPOCHS = 100
+DEFAULT_SAVE_EVERY = 10
+DEFAULT_DEVICE = "auto"
+DEFAULT_SRRL_TUNING_DIR = os.path.join("artifacts", "srrl_tuning")
+SRRL_HP_KEYS_SKIP_FROM_FILE = frozenset({"cls_warmup_epochs"})
 
 
 def set_global_seed(seed: int | None):
@@ -116,6 +123,8 @@ def load_best_srrl_params_from_tuning(tuning_dir: str) -> bool:
         return False
     int_keys = {"n_step", "batch_size", "var_window", "cls_warmup_epochs"}
     for key, val in params.items():
+        if key in SRRL_HP_KEYS_SKIP_FROM_FILE:
+            continue
         if key not in SRRL_HPARAMS:
             continue
         if key in int_keys:
@@ -130,32 +139,74 @@ def load_best_srrl_params_from_tuning(tuning_dir: str) -> bool:
     return True
 
 
-def apply_srrl_overrides(args):
-    """Apply SRRL-specific CLI overrides in-place to SRRL_HPARAMS."""
-    mapping = {
-        "srrl_lr": "lr",
-        "srrl_tau": "tau",
-        "srrl_batch_size": "batch_size",
-        "srrl_discount_gamma": "discount_gamma",
-        "srrl_n_step": "n_step",
-        "srrl_gamma_risk": "gamma_risk",
-        "srrl_risk_lambda": "risk_lambda",
-        "srrl_var_window": "var_window",
-        "srrl_terminal_utility_weight": "terminal_utility_weight",
-        "srrl_sigma_explore": "sigma_explore",
-        "srrl_sigma_explore_min": "sigma_explore_min",
-        "srrl_turnover_penalty": "turnover_penalty",
-        "srrl_cls_warmup_epochs": "cls_warmup_epochs",
-        "srrl_dropout": "dropout",
-        "srrl_weight_decay": "weight_decay",
-        "srrl_cls_label_smoothing": "cls_label_smoothing",
-    }
-    for arg_key, hp_key in mapping.items():
-        v = getattr(args, arg_key, None)
-        if v is not None:
-            SRRL_HPARAMS[hp_key] = v
+def merge_srrl_params_dict(params: dict) -> None:
+    """Merge tuning-style hyperparameter keys into SRRL_HPARAMS in place."""
+    int_keys = {"n_step", "batch_size", "var_window", "cls_warmup_epochs"}
+    for key, val in params.items():
+        if key in SRRL_HP_KEYS_SKIP_FROM_FILE:
+            continue
+        if key not in SRRL_HPARAMS:
+            continue
+        if key in int_keys:
+            SRRL_HPARAMS[key] = int(round(float(val)))
+        else:
+            SRRL_HPARAMS[key] = float(val) if isinstance(SRRL_HPARAMS[key], (int, float)) else val
     if SRRL_HPARAMS["sigma_explore_min"] > SRRL_HPARAMS["sigma_explore"]:
         SRRL_HPARAMS["sigma_explore_min"] = SRRL_HPARAMS["sigma_explore"]
+
+
+def merge_srrl_hp_patch_from_env() -> None:
+    """If SRRL_HP_PATCH points to a JSON file, merge into SRRL_HPARAMS (used by srrl_tuning trials)."""
+    path = os.environ.get("SRRL_HP_PATCH", "").strip()
+    if not path or not os.path.isfile(path):
+        return
+    try:
+        with open(path, encoding="utf-8") as f:
+            patch = json.load(f)
+    except Exception as e:
+        print(f"SRRL_HP_PATCH: failed to load {path}: {e}")
+        return
+    if isinstance(patch, dict):
+        merge_srrl_params_dict(patch)
+        print(f"SRRL: merged hyperparameter patch from {path}")
+
+
+def load_training_config() -> SimpleNamespace:
+    """No CLI: defaults below; srrl_tuning sets SRRL_* environment variables."""
+    raw_epochs = os.environ.get("SRRL_TRAIN_EPOCHS", "").strip()
+    epochs = int(raw_epochs) if raw_epochs else DEFAULT_TRAINING_EPOCHS
+
+    raw_save = os.environ.get("SRRL_SAVE_EVERY", "").strip()
+    save_every = int(raw_save) if raw_save else DEFAULT_SAVE_EVERY
+
+    device = os.environ.get("SRRL_DEVICE", "").strip() or DEFAULT_DEVICE
+
+    tuning_dir = os.environ.get("SRRL_TUNING_DIR", "").strip() or DEFAULT_SRRL_TUNING_DIR
+
+    seed_raw = os.environ.get("SRRL_SEED", "").strip()
+    seed = int(seed_raw) if seed_raw else None
+
+    no_amp = os.environ.get("SRRL_NO_AMP", "").strip().lower() in ("1", "true", "yes")
+    no_compile = os.environ.get("SRRL_NO_COMPILE", "").strip().lower() in ("1", "true", "yes")
+    env_diagnostic_no_risk_tax = os.environ.get("SRRL_DIAG_NO_RISK_TAX", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+    return SimpleNamespace(
+        agent="SRRL",
+        epochs=epochs,
+        save_every=max(1, save_every),
+        device=device,
+        tuning_dir=tuning_dir,
+        seed=seed,
+        no_amp=no_amp,
+        no_compile=no_compile,
+        env_diagnostic_no_risk_tax=env_diagnostic_no_risk_tax,
+        max_grad_norm=1.0,
+        resolved_device=None,
+    )
 
 
 def print_srrl_hparams():
@@ -172,7 +223,6 @@ def print_srrl_hparams():
         "sigma_explore",
         "sigma_explore_min",
         "turnover_penalty",
-        "cls_warmup_epochs",
         "dropout",
         "weight_decay",
         "cls_label_smoothing",
@@ -1140,11 +1190,9 @@ class SRRLTrainer(BaseTrainer):
             diagnostic_no_risk_tax=_diag,
         )
         self.n_step = SRRL_HPARAMS["n_step"]
-        K = max(0, int(SRRL_HPARAMS.get("cls_warmup_epochs", 0)))
-        self.cls_warmup_epochs = K
-        # K>0: K epochs classification-only, then K epochs RL-only (total 2*K). K==0: RL only for args.epochs.
-        if K > 0:
-            self.epochs = 2 * K
+        total = max(1, int(args.epochs))
+        self.epochs = total
+        self.cls_warmup_epochs = total // 2  # first half cls-only; second half RL-only (no CLI)
         self._cls_frozen_for_rl = False
         self._episode_diag = {}
 
@@ -1191,12 +1239,13 @@ class SRRLTrainer(BaseTrainer):
         if self.epochs <= 1:
             return sigma_lo
         K = self.cls_warmup_epochs
+        rl_total = max(1, self.epochs - K)
         if K > 0:
-            # Anneal exploration across the RL half only; hold max sigma during cls rollouts.
+            # Anneal exploration across the RL phase only; hold max sigma during cls rollouts.
             if epoch <= K:
                 return sigma_hi
             rl_epoch = epoch - K
-            rl_span = max(1, K - 1)
+            rl_span = max(1, rl_total - 1)
             frac = float(max(0, rl_epoch - 1)) / float(rl_span)
             return sigma_hi + (sigma_lo - sigma_hi) * frac
         frac = float(max(0, epoch - 1)) / float(max(1, self.epochs - 1))
@@ -1426,13 +1475,14 @@ class SRRLTrainer(BaseTrainer):
     def train(self):
         print(f"\n{'=' * 60}")
         K = self.cls_warmup_epochs
+        rl_part = self.epochs - K
         if K > 0:
             print(
-                f"Training SRRL agent for {self.epochs} epochs total "
-                f"({K} cls-only, then {K} RL-only); --epochs ({self.args.epochs}) ignored while K>0"
+                f"Training SRRL for {self.epochs} epochs "
+                f"({K} classification-only, then {rl_part} RL-only; first/second half split)"
             )
         else:
-            print(f"Training SRRL agent for {self.epochs} epochs (RL-only)")
+            print(f"Training SRRL for {self.epochs} epochs (RL-only; single epoch cannot split)")
         print(f"Device: {self.device} ({self.device.type}) | Pairs: {self.n_pairs}")
         print(f"{'=' * 60}\n")
 
@@ -1487,7 +1537,7 @@ class SRRLTrainer(BaseTrainer):
 
 
 # ============================================================================
-# CLI entry point
+# Main entry point
 # ============================================================================
 
 def _checkpoint_rank_key(ckpt_path: str):
@@ -1668,95 +1718,11 @@ def evaluate_and_promote_best_insample_checkpoint(
     print(f"[in-sample] report: {csv_path}")
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description=(
-            "RL Pairs Trading -- SRRL training (supervised–RL hybrid). "
-            "Best hyperparameters load from --srrl-tuning-dir/trials.csv when present."
-        )
-    )
-    parser.add_argument(
-        "--srrl-tuning-dir",
-        type=str,
-        default=os.path.join("artifacts", "srrl_tuning"),
-        help="Directory containing trials.csv from srrl_tuning.py (best row merged into SRRL_HPARAMS).",
-    )
-    parser.add_argument("--agent", type=str, default="SRRL",
-                        choices=["SRRL"],
-                        help="SRRL only (MPHDRL/Benchmark code kept in file but unregistered).")
-    parser.add_argument("--epochs", type=int, default=100,
-                        help="Number of training epochs (default: 100)")
-    parser.add_argument("--device", type=str, default="auto",
-                        help="Torch device: auto (CUDA>MPS>CPU), cuda, mps, or cpu (default: auto)")
-    parser.add_argument("--save-every", type=int, default=10, dest="save_every",
-                        help="Save checkpoint every N epochs (default: 10)")
-    parser.add_argument("--no-amp", action="store_true",
-                        help="Disable CUDA mixed precision (default: AMP on when using CUDA)")
-    parser.add_argument("--no-compile", action="store_true",
-                        help="Disable torch.compile on forward_step (default: compile on CUDA)")
-    parser.add_argument(
-        "--env-diagnostic-no-risk-tax",
-        action="store_true",
-        dest="env_diagnostic_no_risk_tax",
-        help=(
-            "Training env: net reward without variance penalty; no STCG tax flows; "
-            "terminal utility bonus off; txn and shorting costs unchanged (diagnostic runs)."
-        ),
-    )
-    parser.add_argument("--seed", type=int, default=None, help="Global random seed for reproducible runs.")
-    parser.add_argument("--srrl-lr", type=float, default=None, dest="srrl_lr")
-    parser.add_argument("--srrl-tau", type=float, default=None, dest="srrl_tau")
-    parser.add_argument("--srrl-batch-size", type=int, default=None, dest="srrl_batch_size")
-    parser.add_argument("--srrl-discount-gamma", type=float, default=None, dest="srrl_discount_gamma")
-    parser.add_argument("--srrl-n-step", type=int, default=None, dest="srrl_n_step")
-    parser.add_argument("--srrl-gamma-risk", type=float, default=None, dest="srrl_gamma_risk")
-    parser.add_argument("--srrl-risk-lambda", type=float, default=None, dest="srrl_risk_lambda")
-    parser.add_argument("--srrl-var-window", type=int, default=None, dest="srrl_var_window")
-    parser.add_argument("--srrl-terminal-utility-weight", type=float, default=None, dest="srrl_terminal_utility_weight")
-    parser.add_argument("--srrl-sigma-explore", type=float, default=None, dest="srrl_sigma_explore")
-    parser.add_argument("--srrl-sigma-explore-min", type=float, default=None, dest="srrl_sigma_explore_min")
-    parser.add_argument("--srrl-turnover-penalty", type=float, default=None, dest="srrl_turnover_penalty")
-    parser.add_argument(
-        "--srrl-cls-warmup-epochs",
-        type=int,
-        default=None,
-        dest="srrl_cls_warmup_epochs",
-        help=(
-            "SRRL: K>0 runs K epochs classification-only then K epochs RL-only (total 2K; --epochs ignored). "
-            "0 = RL-only for full --epochs."
-        ),
-    )
-    parser.add_argument(
-        "--srrl-dropout",
-        type=float,
-        default=None,
-        dest="srrl_dropout",
-        help="SRRL: dropout probability on encoder outputs and MLP hidden layers (train-only; 0 disables).",
-    )
-    parser.add_argument(
-        "--srrl-weight-decay",
-        type=float,
-        default=None,
-        dest="srrl_weight_decay",
-        help="SRRL: Adam L2 weight decay on all SRRL parameter groups.",
-    )
-    parser.add_argument(
-        "--srrl-cls-label-smoothing",
-        type=float,
-        default=None,
-        dest="srrl_cls_label_smoothing",
-        help="SRRL: BCE label smoothing (blend toward 0.5); 0 disables.",
-    )
-    return parser.parse_args()
-
-
 def main():
-    args = parse_args()
+    args = load_training_config()
     set_global_seed(args.seed)
-    load_best_srrl_params_from_tuning(args.srrl_tuning_dir)
-    apply_srrl_overrides(args)
-    # SRRLTrainer uses cls_warmup_epochs as K: K epochs cls + K epochs RL (total 2K). No cap vs --epochs.
-    SRRL_HPARAMS["cls_warmup_epochs"] = max(0, int(SRRL_HPARAMS.get("cls_warmup_epochs", 0)))
+    load_best_srrl_params_from_tuning(args.tuning_dir)
+    merge_srrl_hp_patch_from_env()
 
     resolved = resolve_training_device(args.device)
     configure_accelerator(resolved)
@@ -1764,7 +1730,8 @@ def main():
 
     print("=" * 60)
     print(f"Agent: {args.agent}")
-    print(f"Device: {resolved} (from --device {args.device!r})")
+    print(f"Epochs: {args.epochs} (classification first half, RL second half)")
+    print(f"Device: {resolved} (SRRL_DEVICE={args.device!r})")
     if resolved.type == "cuda":
         print(
             f"Speed opts: AMP={'off' if args.no_amp else 'on (bf16 or fp16+scaler)'}, "
