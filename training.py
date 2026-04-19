@@ -4,8 +4,9 @@ training.py -- MPHDRL training harness for RL pairs trading.
 Run with no arguments:
     python training.py
 
-Hyperparameters default from MPHDRL.HPARAMS, then optional merge from artifacts/mphdrl_tuning/trials.csv
-(best trial). Single continuous RL schedule (no classification phase).
+Hyperparameters start from MPHDRL.py defaults each run, then optionally merge the best row from
+artifacts/mphdrl_tuning/trials.csv if tuning has been run; otherwise defaults are used unchanged.
+Single continuous RL schedule (no classification phase).
 
 Optional environment overrides (for automation / mphdrl_tuning.py):
     MPHDRL_TRAIN_EPOCHS, MPHDRL_DEVICE, MPHDRL_SEED, MPHDRL_SAVE_EVERY, MPHDRL_TUNING_DIR,
@@ -18,6 +19,7 @@ On CUDA (default): cudnn benchmark, TF32, mixed precision, torch.compile unless 
 """
 
 import contextlib
+import copy
 import os
 import sys
 import time
@@ -52,6 +54,9 @@ from MPHDRL import (
     check_data_readiness,
 )
 from benchmark import BENCHMARK_MODEL_DIR, BenchmarkDDPG
+
+# Frozen copy of MPHDRL.py defaults for reset before optional tuning merge.
+_DEFAULT_MPHDRL_HPARAMS = copy.deepcopy(dict(HPARAMS))
 # SRRL trainer disabled by default; keep imports so SRRL class bodies parse if restored.
 from SRRL import SRRL_HPARAMS, SRRL_MODEL_DIR, SRRLTrader
 from backtest_core import (
@@ -68,6 +73,12 @@ DEFAULT_TRAINING_EPOCHS = 100
 DEFAULT_SAVE_EVERY = 10
 DEFAULT_DEVICE = "auto"
 DEFAULT_MPHDRL_TUNING_DIR = os.path.join("artifacts", "mphdrl_tuning")
+
+
+def reset_mphdrl_hparams_to_defaults() -> None:
+    """Reset MPHDRL.HPARAMS to built-in defaults (before loading tuning or patch)."""
+    HPARAMS.clear()
+    HPARAMS.update(copy.deepcopy(_DEFAULT_MPHDRL_HPARAMS))
 
 
 def set_global_seed(seed: int | None):
@@ -109,6 +120,7 @@ def load_best_mphdrl_params_from_tuning(tuning_dir: str) -> bool:
         ok["utility"] = pd.to_numeric(ok["utility"], errors="coerce")
         ok = ok.dropna(subset=["utility"])
     if ok.empty:
+        print("MPHDRL tuning: no usable utility values — using defaults from MPHDRL.py")
         return False
     ok = ok.sort_values("utility", ascending=False)
     row = ok.iloc[0]
@@ -1720,8 +1732,14 @@ def evaluate_and_promote_best_insample_checkpoint(
 def main():
     args = load_training_config()
     set_global_seed(args.seed)
-    load_best_mphdrl_params_from_tuning(args.tuning_dir)
+    reset_mphdrl_hparams_to_defaults()
+    loaded_from_tuning = load_best_mphdrl_params_from_tuning(args.tuning_dir)
     merge_mphdrl_hp_patch_from_env()
+    if not loaded_from_tuning and not os.environ.get("MPHDRL_HP_PATCH", "").strip():
+        print(
+            "Hyperparameters: built-in MPHDRL defaults (no trials.csv / patch). "
+            "Run mphdrl_tuning.py to populate artifacts/mphdrl_tuning/trials.csv."
+        )
 
     resolved = resolve_training_device(args.device)
     configure_accelerator(resolved)
