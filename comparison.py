@@ -45,8 +45,12 @@ except ImportError:
     BACKTEST_DIR = os.path.join("data", "backtest")
     INITIAL_CASH = 10_000_000.0
 
+try:
+    from backtest_core import BACKTEST_RISK_AVERSION as UTILITY_GAMMA
+except ImportError:
+    UTILITY_GAMMA = 2.0
+
 RESULTS_SUBDIR = "results"
-UTILITY_GAMMA = 0.5
 DEFAULT_UTILITY_WINDOW = 60
 DEFAULT_SIGNIFICANCE_ALPHA = 0.05
 

@@ -269,7 +269,7 @@ def score_mphdrl_checkpoint(root: Path, ckpt_path: Path, params: Dict[str, float
         return compute_utility_from_mphdrl_csv(Path())
 
     df_bt = run_strategy_backtest("MPHDRL tuning", weights_by_date, price_wide, tickers, valid_dates)
-    return summarize_backtest_dataframe(df_bt, gamma=0.5)
+    return summarize_backtest_dataframe(df_bt)
 
 
 def run_trial(

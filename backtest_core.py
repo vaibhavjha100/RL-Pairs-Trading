@@ -19,6 +19,9 @@ STCG_RATE = 0.20
 LTCG_RATE = 0.125
 FISCAL_YEAR_END = (3, 31)
 
+# Mean-variance utility U = μ_ann - 0.5 * γ * σ²_ann (used in backtest summaries & comparison.py).
+BACKTEST_RISK_AVERSION = 2.0
+
 RESULT_COLUMNS = [
     "date",
     "gross_portfolio_value",
@@ -437,7 +440,9 @@ def run_nifty50_buy_hold_backtest(
     return df
 
 
-def compute_annualized_utility(net_returns, gamma: float = 0.5) -> Dict[str, float]:
+def compute_annualized_utility(
+    net_returns, gamma: float = BACKTEST_RISK_AVERSION,
+) -> Dict[str, float]:
     r = pd.to_numeric(pd.Series(net_returns), errors="coerce").fillna(0.0).to_numpy()
     mu = float(np.mean(r)) if len(r) else 0.0
     var = float(np.var(r, ddof=1)) if len(r) > 1 else 0.0
@@ -453,7 +458,9 @@ def compute_annualized_utility(net_returns, gamma: float = 0.5) -> Dict[str, flo
     }
 
 
-def summarize_backtest_dataframe(df: pd.DataFrame, gamma: float = 0.5) -> Dict[str, float]:
+def summarize_backtest_dataframe(
+    df: pd.DataFrame, gamma: float = BACKTEST_RISK_AVERSION,
+) -> Dict[str, float]:
     if df is None or df.empty or "net_portfolio_return" not in df.columns:
         return {
             "utility": float("-inf"),

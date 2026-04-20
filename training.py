@@ -1654,7 +1654,7 @@ def evaluate_and_promote_best_insample_checkpoint(
                     model, meta_train, x_train, pair_key_to_idx, n_pairs, f_dim, train_dates
                 )
             df_bt = run_strategy_backtest(f"{agent_name} in-sample", weights_by_date, price_wide, tickers, valid_dates)
-            m = summarize_backtest_dataframe(df_bt, gamma=0.5)
+            m = summarize_backtest_dataframe(df_bt)
             rows.append(
                 {
                     "checkpoint": os.path.abspath(ckpt),

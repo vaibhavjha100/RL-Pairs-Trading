@@ -38,7 +38,6 @@ from traditional import (
     TRADITIONAL_PARAMS_PATH,
     compute_traditional_weights_by_date,
     load_precomputed_spread_wide,
-    pick_weakest_traditional_params,
     resolve_traditional_params,
 )
 
@@ -455,16 +454,6 @@ def parse_args():
             f"(default: use built-in fixed params, or merge {TRADITIONAL_PARAMS_PATH} if present)"
         ),
     )
-    p.add_argument(
-        "--traditional-pick",
-        type=str,
-        choices=("weakest", "baseline"),
-        default="weakest",
-        help=(
-            "weakest: score several rule presets on this walk-forward window and use "
-            "the lowest-utility one (easier RL benchmark). baseline: pickle/defaults only."
-        ),
-    )
     return p.parse_args()
 
 
@@ -588,24 +577,8 @@ def main():
         # Same pairs as RL; hedge_ratios.pkl + spread/raw.csv are pipeline outputs (not recomputed).
         with open(hedge_path, "rb") as f:
             hedge_ratios = pickle.load(f)
-        pick = (os.environ.get("TRADITIONAL_PICK") or args.traditional_pick or "weakest").strip().lower()
-        if pick == "baseline":
-            trad_params = resolve_traditional_params(args.traditional_params or TRADITIONAL_PARAMS_PATH)
-            print("  Traditional: baseline params (pickle merge / defaults).")
-        else:
-            trad_params, trad_variant, util_by = pick_weakest_traditional_params(
-                valid_dates,
-                pairs,
-                hedge_ratios,
-                price_wide,
-                tickers,
-                spread_wide=spread_wide,
-                gamma=0.5,
-            )
-            print(f"  Traditional: weakest variant = {trad_variant!r} (min utility among presets).")
-            for vn, uu in sorted(util_by.items(), key=lambda kv: (kv[1] if np.isfinite(kv[1]) else float("inf"))):
-                u_str = f"{uu:.6f}" if np.isfinite(uu) else "nan"
-                print(f"    utility[{vn}] = {u_str}")
+        trad_params = resolve_traditional_params(args.traditional_params or TRADITIONAL_PARAMS_PATH)
+        print("  Traditional: params from defaults + optional pickle merge (see traditional.py).")
         trad_weights = compute_traditional_weights_by_date(
             valid_dates, pairs, hedge_ratios, trad_params, spread_wide=spread_wide,
         )
