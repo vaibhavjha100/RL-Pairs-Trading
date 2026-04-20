@@ -3,7 +3,7 @@ comparison.py -- Formal backtest comparison: performance metrics, common-size co
 and one-tailed paired Wilcoxon signed-rank tests on daily mean-variance utility (net).
 
 Reads CSVs from backtest.py:
-    data/backtest/mphdrl.csv, benchmark.csv, traditional.csv
+    data/backtest/mphdrl.csv, nifty50_buy_hold.csv, benchmark.csv, traditional.csv, srrl.csv
 
 Writes:
     data/backtest/results/comparison_summary.txt
@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 import sys
+from datetime import datetime
 from typing import Any
 
 import numpy as np
@@ -51,8 +52,10 @@ DEFAULT_SIGNIFICANCE_ALPHA = 0.05
 
 STRATEGY_FILES = (
     ("MPHDRL", "mphdrl.csv"),
+    ("Nifty 50 buy-and-hold", "nifty50_buy_hold.csv"),
     ("Benchmark RL", "benchmark.csv"),
     ("Traditional pairs", "traditional.csv"),
+    ("SRRL", "srrl.csv"),
 )
 
 
@@ -112,29 +115,88 @@ def mean_variance_utility_ann(
     return u, r_ann, v_ann
 
 
+def _normalize_date_column(s: pd.Series) -> pd.Series:
+    """UTC-stripped, calendar-day timestamps for stable merges across CSVs."""
+    return pd.to_datetime(s, utc=True, errors="coerce").dt.tz_localize(None).dt.normalize()
+
+
+def normalize_backtest_df(df: pd.DataFrame, name: str) -> pd.DataFrame:
+    """Sort by date, drop duplicate days, validate required columns."""
+    req = [
+        "date",
+        "gross_portfolio_value",
+        "net_portfolio_value",
+        "gross_portfolio_return",
+        "net_portfolio_return",
+        "transaction_cost",
+        "shorting_cost",
+        "tax_flow",
+    ]
+    missing = [c for c in req if c not in df.columns]
+    if missing:
+        raise ValueError(f"{name}: missing columns {missing}")
+    out = df.copy()
+    out["date"] = _normalize_date_column(out["date"])
+    out = out.dropna(subset=["date"]).sort_values("date")
+    if out["date"].duplicated().any():
+        n_dup = int(out["date"].duplicated().sum())
+        out = out.drop_duplicates(subset=["date"], keep="last")
+        print(
+            f"Warning: {name} had {n_dup} duplicate date row(s); kept last row per day.",
+            file=sys.stderr,
+        )
+    return out.reset_index(drop=True)
+
+
 def rolling_daily_net_utility(
     df: pd.DataFrame, window: int, gamma: float
-) -> pd.Series:
-    """U_t from trailing net returns; index = date. NaN until min_periods met."""
+) -> pd.DataFrame:
+    """
+    U_t from trailing net returns on aligned rows. NaN until min_periods met.
+    Returns a two-column frame (date, rolling_u) for merge-safe alignment (no reindex drift).
+    """
     d = df.sort_values("date").reset_index(drop=True)
     r = d["net_portfolio_return"].astype(float)
     r_ann = r.rolling(window=window, min_periods=2).mean() * 252.0
     v_ann = r.rolling(window=window, min_periods=2).var(ddof=1) * 252.0
     u = r_ann - 0.5 * gamma * v_ann
-    idx = pd.to_datetime(d["date"])
-    return pd.Series(u.values, index=idx)
+    out = pd.DataFrame({"date": _normalize_date_column(d["date"]), "rolling_u": u.values})
+    return out
 
 
 def load_strategy_csv(base_dir: str, filename: str) -> pd.DataFrame | None:
     path = os.path.join(base_dir, filename)
     if not os.path.isfile(path):
         return None
-    return pd.read_csv(path, parse_dates=["date"])
+    df = pd.read_csv(path, encoding="utf-8-sig")
+    df.columns = [c.strip().lstrip("\ufeff") for c in df.columns]
+    if "date" not in df.columns:
+        raise ValueError(f"{path}: no 'date' column (got {list(df.columns)[:8]}...)")
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"])
+    return df
+
+
+def looks_like_flat_returns(df: pd.DataFrame, col: str = "net_portfolio_return") -> bool:
+    r = pd.to_numeric(df[col], errors="coerce").astype(float).values
+    r = r[np.isfinite(r)]
+    if r.size < 2:
+        return True
+    if float(np.nanstd(r, ddof=1)) < 1e-14 and float(np.nanmax(np.abs(r))) < 1e-14:
+        return True
+    return False
 
 
 def summarize(df: pd.DataFrame, name: str) -> dict[str, Any]:
     if df is None or df.empty:
         return {"strategy": name, "ok": False}
+
+    if looks_like_flat_returns(df, "net_portfolio_return"):
+        print(
+            f"Warning: {name} net_portfolio_return is flat (~zero variance). "
+            f"Re-run backtest after training; metrics may look like no trading.",
+            file=sys.stderr,
+        )
 
     g_end = float(df["gross_portfolio_value"].iloc[-1])
     n_end = float(df["net_portfolio_value"].iloc[-1])
@@ -196,24 +258,27 @@ def summarize(df: pd.DataFrame, name: str) -> dict[str, Any]:
     }
 
 
-def run_wilcoxon_mphdrl_greater(
-    u_mph: pd.Series,
-    u_bench: pd.Series,
-    label_bench: str,
+def run_wilcoxon_paired(
+    u_a: pd.Series,
+    u_b: pd.Series,
+    label_a: str,
+    label_b: str,
 ) -> dict[str, Any]:
-    """Paired differences MPHDRL - bench; H1: median > 0."""
-    j = pd.DataFrame({"mph": u_mph, "bench": u_bench}).dropna()
+    """Paired Wilcoxon signed-rank: H1 median(u_a - u_b) > 0."""
+    j = pd.DataFrame({"a": u_a, "b": u_b}).dropna()
     if len(j) < 3:
         return {
-            "benchmark": label_bench,
+            "strategy_a": label_a,
+            "benchmark": label_b,
             "n_pairs": int(len(j)),
             "error": "insufficient paired observations (need >= 3)",
         }
-    d = (j["mph"] - j["bench"]).values.astype(float)
+    d = (j["a"] - j["b"]).values.astype(float)
     d = d[np.isfinite(d)]
     if d.size < 3:
         return {
-            "benchmark": label_bench,
+            "strategy_a": label_a,
+            "benchmark": label_b,
             "n_pairs": int(d.size),
             "error": "insufficient finite differences",
         }
@@ -224,17 +289,19 @@ def run_wilcoxon_mphdrl_greater(
             res = wilcoxon(d, alternative="greater", zero_method="wilcox")
     except ValueError as e:
         return {
-            "benchmark": label_bench,
+            "strategy_a": label_a,
+            "benchmark": label_b,
             "n_pairs": int(d.size),
             "error": str(e),
         }
     stat = res.statistic
     pval = res.pvalue
     return {
-        "benchmark": label_bench,
+        "strategy_a": label_a,
+        "benchmark": label_b,
         "test": "Wilcoxon signed-rank",
         "pairing": "paired_calendar_dates",
-        "difference": "U_MPHDRL(t) - U_benchmark(t)",
+        "difference": f"U_{label_a}(t) - U_{label_b}(t)",
         "n_pairs": int(d.size),
         "alternative": "greater",
         "zero_method": "wilcox",
@@ -308,26 +375,22 @@ def build_report(
             f"{s['total_costs_pct_initial_cash']:>7.3f}% {s['costs_bps_per_year_of_mean_gross_pv']:>10.1f}"
         )
     lines.append("")
-    lines.append("--- Hypothesis tests: median daily rolling utility (MPHDRL vs benchmark) ---")
+    lines.append("--- Hypothesis tests: median daily rolling utility (paired Wilcoxon) ---")
     lines.append(utility_definition_text(window, gamma))
     lines.append("")
-    lines.append("Specification (same for each benchmark below):")
+    lines.append("Specification (same for each test below):")
     lines.append("  Procedure : scipy.stats.wilcoxon (paired Wilcoxon signed-rank)")
     lines.append("  Pairing   : one observation per common calendar date t (inner join on date)")
-    lines.append(
-        "  Difference: d_t = U_MPHDRL(t) - U_benchmark(t), net rolling utility as defined above"
-    )
-    lines.append("  Alternative: 'greater' (one-tailed test on d_t)")
+    lines.append("  Alternative: 'greater' (one-tailed test on d_t = U_A(t) - U_B(t))")
     lines.append("  Zeros     : zero_method='wilcox' (zeros excluded from ranking per Wilcoxon)")
     lines.append(f"  Significance level: alpha = {alpha:g} (reject H0 if p-value < alpha)")
     lines.append("")
-    lines.append("Hypotheses (each benchmark block):")
-    lines.append("  H0: median(d_t) <= 0   (MPHDRL not greater than benchmark on median daily utility)")
-    lines.append("  H1: median(d_t) > 0    (MPHDRL greater than benchmark on median daily utility)")
-    lines.append("")
     for w in wilcox_rows:
+        strat_a = w.get("strategy_a", "?")
         bench = w.get("benchmark", "?")
-        lines.append(f"  [{bench}]")
+        lines.append(f"  [{strat_a} vs {bench}]")
+        lines.append(f"    H0: median(U_{strat_a} - U_{bench}) <= 0")
+        lines.append(f"    H1: median(U_{strat_a} - U_{bench}) > 0")
         if "error" in w:
             lines.append(f"    Status   : not run — {w['error']}")
             lines.append(f"    n (pairs): {w.get('n_pairs', 0)}")
@@ -372,49 +435,98 @@ def main() -> None:
         print("--alpha must be in (0, 1)", file=sys.stderr)
         sys.exit(1)
 
+    print("Data sources (run `python backtest.py` before this if metrics look stale):\n")
     loaded: dict[str, pd.DataFrame] = {}
     summaries: list[dict[str, Any]] = []
     for name, fname in STRATEGY_FILES:
+        path = os.path.join(base, fname)
         df = load_strategy_csv(base, fname)
         if df is None:
-            print(f"Missing: {os.path.join(base, fname)}", file=sys.stderr)
+            print(f"Missing: {path}", file=sys.stderr)
             summaries.append({"strategy": name, "ok": False})
         else:
+            try:
+                df = normalize_backtest_df(df, name)
+            except ValueError as e:
+                print(str(e), file=sys.stderr)
+                summaries.append({"strategy": name, "ok": False})
+                continue
             loaded[name] = df
             summaries.append(summarize(df, name))
+            try:
+                mtime = os.path.getmtime(path)
+                ts = datetime.fromtimestamp(mtime).isoformat(timespec="seconds")
+                print(f"Loaded {name}: {os.path.abspath(path)} (modified {ts})")
+            except OSError:
+                print(f"Loaded {name}: {os.path.abspath(path)}")
 
-    if not all(s.get("ok") for s in summaries):
-        print("All three backtest CSVs are required. Run:  python backtest.py", file=sys.stderr)
+    ok_names = [s["strategy"] for s in summaries if s.get("ok")]
+    if len(ok_names) < 2:
+        print(
+            f"Need at least 2 strategies with valid CSVs for comparison. Found: {ok_names}. "
+            "Run:  python backtest.py",
+            file=sys.stderr,
+        )
         sys.exit(1)
+    missing_names = [s["strategy"] for s in summaries if not s.get("ok")]
+    if missing_names:
+        print(f"  Skipping strategies with missing/invalid CSVs: {missing_names}", file=sys.stderr)
 
-    df_mph = loaded["MPHDRL"].sort_values("date").reset_index(drop=True)
-    df_bench = loaded["Benchmark RL"].sort_values("date").reset_index(drop=True)
-    df_trad = loaded["Traditional pairs"].sort_values("date").reset_index(drop=True)
+    rolling_frames: dict[str, pd.DataFrame] = {}
+    for name in ok_names:
+        df_s = loaded[name].sort_values("date").reset_index(drop=True)
+        udf = rolling_daily_net_utility(df_s, window, gamma).rename(
+            columns={"rolling_u": f"u_{name}"}
+        )
+        rolling_frames[name] = udf
 
-    u_mph = rolling_daily_net_utility(df_mph, window, gamma)
-    u_bench = rolling_daily_net_utility(df_bench, window, gamma)
-    u_trad = rolling_daily_net_utility(df_trad, window, gamma)
+    j = None
+    for name, udf in rolling_frames.items():
+        if j is None:
+            j = udf
+        else:
+            j = j.merge(udf, on="date", how="inner")
+    if j is None or j.empty:
+        print(
+            "Error: no overlapping dates after merging rolling utilities. Check date formats in CSVs.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    dates = j["date"].values
+    util_series: dict[str, pd.Series] = {}
+    for name in ok_names:
+        col = f"u_{name}"
+        if col in j.columns:
+            util_series[name] = pd.Series(j[col].values, index=dates)
 
-    common = (
-        df_mph[["date"]]
-        .merge(df_bench[["date"]], on="date")
-        .merge(df_trad[["date"]], on="date")
-        .sort_values("date")
-    )
-    dates = pd.to_datetime(common["date"]).values
-
-    s_mph = u_mph.reindex(dates).values
-    s_bench = u_bench.reindex(dates).values
-    s_trad = u_trad.reindex(dates).values
-
-    ser_mph = pd.Series(s_mph, index=dates)
-    ser_bench = pd.Series(s_bench, index=dates)
-    ser_trad = pd.Series(s_trad, index=dates)
-
-    wilcox_rows = [
-        run_wilcoxon_mphdrl_greater(ser_mph, ser_bench, "Benchmark RL"),
-        run_wilcoxon_mphdrl_greater(ser_mph, ser_trad, "Traditional pairs"),
-    ]
+    wilcox_rows: list[dict[str, Any]] = []
+    if "MPHDRL" in util_series:
+        if "Nifty 50 buy-and-hold" in util_series:
+            wilcox_rows.append(
+                run_wilcoxon_paired(
+                    util_series["MPHDRL"],
+                    util_series["Nifty 50 buy-and-hold"],
+                    "MPHDRL",
+                    "Nifty 50 buy-and-hold",
+                )
+            )
+        if "Benchmark RL" in util_series:
+            wilcox_rows.append(
+                run_wilcoxon_paired(util_series["MPHDRL"], util_series["Benchmark RL"], "MPHDRL", "Benchmark RL")
+            )
+        if "Traditional pairs" in util_series:
+            wilcox_rows.append(
+                run_wilcoxon_paired(util_series["MPHDRL"], util_series["Traditional pairs"], "MPHDRL", "Traditional pairs")
+            )
+    if "SRRL" in util_series:
+        if "Traditional pairs" in util_series:
+            wilcox_rows.append(
+                run_wilcoxon_paired(util_series["SRRL"], util_series["Traditional pairs"], "SRRL", "Traditional pairs")
+            )
+        if "MPHDRL" in util_series:
+            wilcox_rows.append(
+                run_wilcoxon_paired(util_series["SRRL"], util_series["MPHDRL"], "SRRL", "MPHDRL")
+            )
 
     tests_for_json: list[dict[str, Any]] = []
     for w in wilcox_rows:
@@ -436,13 +548,13 @@ def main() -> None:
         "window": window,
         "significance_alpha": alpha,
         "hypotheses": {
-            "H0": "median(U_MPHDRL - U_benchmark) <= 0",
-            "H1": "median(U_MPHDRL - U_benchmark) > 0",
+            "H0": "median(U_A - U_B) <= 0",
+            "H1": "median(U_A - U_B) > 0",
         },
         "test_specification": {
             "procedure": "scipy.stats.wilcoxon",
             "paired_on": "date",
-            "difference": "U_MPHDRL(t) - U_benchmark(t)",
+            "difference": "U_A(t) - U_B(t)",
             "alternative": "greater",
             "zero_method": "wilcox",
         },

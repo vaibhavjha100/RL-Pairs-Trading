@@ -35,8 +35,20 @@ def pair_exposures_to_weights(E: torch.Tensor, M: torch.Tensor) -> torch.Tensor:
     if E.dim() == 1:
         E = E.unsqueeze(0)
     u = torch.matmul(E, M)
-    w = u / torch.clamp(u.abs().sum(dim=-1, keepdim=True), min=1e-8)
+    u = torch.nan_to_num(u, nan=0.0, posinf=0.0, neginf=0.0)
+
+    l1 = u.abs().sum(dim=-1, keepdim=True)
+    fallback = M[0].unsqueeze(0).expand_as(u)
+    fallback = fallback - fallback.mean(dim=-1, keepdim=True)
+    fallback_l1 = torch.clamp(fallback.abs().sum(dim=-1, keepdim=True), min=1e-8)
+    fallback = fallback / fallback_l1
+
+    w = torch.where(l1 > 1e-8, u / torch.clamp(l1, min=1e-8), fallback)
     w = w - w.mean(dim=-1, keepdim=True)
+    w = torch.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
+
+    w_l1 = w.abs().sum(dim=-1, keepdim=True)
+    w = torch.where(w_l1 > 1e-8, w / torch.clamp(w_l1, min=1e-8), fallback)
     return w
 
 
@@ -173,6 +185,7 @@ class BenchmarkDDPG(nn.Module):
         self,
         windows: np.ndarray | torch.Tensor,
         explore: bool = True,
+        pair_mask: np.ndarray | torch.Tensor | None = None,
     ) -> Dict[str, Any]:
         """
         MPHDRL-compatible keys: weights (B, n_tickers), plus pair_exposures for replay.
@@ -180,7 +193,7 @@ class BenchmarkDDPG(nn.Module):
         Placeholder keys for scripts that expect MPHDRL dict shape.
         """
         if not isinstance(windows, torch.Tensor):
-            w_t = torch.tensor(windows, dtype=torch.float32, device=self._device)
+            w_t = torch.as_tensor(np.asarray(windows), dtype=torch.float32, device=self._device)
         else:
             w_t = windows.to(dtype=torch.float32, device=self._device)
         if w_t.dim() == 3:
@@ -189,8 +202,20 @@ class BenchmarkDDPG(nn.Module):
         assert P == self.n_pairs and Fdim == self.feature_dim
 
         mu = self.actor_mean(w_t)
+        mu = torch.nan_to_num(mu, nan=0.0, posinf=0.0, neginf=0.0)
+        # At eval, pure zeros in mu leave no gradient history for M @ w; nudge so pair weights can trade.
+        if not explore and float(mu.detach().abs().max()) < 1e-8:
+            k = torch.arange(self.n_pairs, device=self._device, dtype=mu.dtype)[None, :]
+            mu = mu + 1e-5 * torch.sin(k * (np.pi / max(self.n_pairs, 1)))
         E = self.sample_E(mu, explore)
+        E = torch.nan_to_num(E, nan=0.0, posinf=0.0, neginf=0.0)
+        if pair_mask is not None:
+            pm = torch.as_tensor(np.asarray(pair_mask), dtype=E.dtype, device=self._device)
+            if pm.dim() == 1:
+                pm = pm.unsqueeze(0)
+            E = E * pm
         w = pair_exposures_to_weights(E, self.M)
+        w = torch.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
 
         probs = torch.full((B, P, 3), 1.0 / 3.0, device=self._device, dtype=w.dtype)
         return {

@@ -1,8 +1,10 @@
 """
-backtest.py -- Walk-forward backtesting for MPHDRL, Benchmark RL, and Traditional pairs.
+backtest.py -- Walk-forward backtesting for MPHDRL, Benchmark RL, Traditional pairs, SRRL, and Nifty 50 buy-and-hold.
 
 Produces daily gross/net PnL, returns, costs, taxes for each strategy and exports
 CSV files to data/backtest/ for downstream comparison (see comparison.py).
+Includes a Nifty 50 buy-and-hold benchmark from ``data/trading/nifty50.csv`` (see
+``backtest_core.run_nifty50_buy_hold_backtest`` for amortized costs/taxes).
 
 Usage:
     python backtest.py
@@ -26,13 +28,17 @@ from MPHDRL import (
     HPARAMS,
     MPHDRL_MODEL_DIR,
     MPHDRLTrader,
+    TradingEnvironment,
     build_pair_ticker_mapping,
 )
 from benchmark import BENCHMARK_MODEL_DIR, H_BENCHMARK, BenchmarkDDPG
+from SRRL import SRRL_MODEL_DIR, SRRLTrader
+from backtest_core import run_nifty50_buy_hold_backtest
 from traditional import (
     TRADITIONAL_PARAMS_PATH,
     compute_traditional_weights_by_date,
     load_precomputed_spread_wide,
+    pick_weakest_traditional_params,
     resolve_traditional_params,
 )
 
@@ -67,6 +73,8 @@ RESULT_COLUMNS = [
     "net_short_return",
     "net_portfolio_value",
     "net_portfolio_return",
+    "mean_abs_weight",
+    "l1_turnover",
 ]
 
 # ---------------------------------------------------------------------------
@@ -118,7 +126,14 @@ def load_price_matrix(tickers):
     if not os.path.isfile(raw_path):
         print(f"Missing {raw_path}. Run collection.py first.")
         sys.exit(1)
-    raw = pd.read_csv(raw_path, parse_dates=["Date"])
+    raw = pd.read_csv(
+        raw_path,
+        parse_dates=["Date"],
+        usecols=["Date", "Ticker", "Close"],
+    )
+    need = set(tickers)
+    raw = raw.loc[raw["Ticker"].isin(need), ["Date", "Ticker", "Close"]]
+    raw = raw.sort_values(["Date", "Ticker"]).drop_duplicates(["Date", "Ticker"], keep="last")
     wide = raw.pivot(index="Date", columns="Ticker", values="Close").sort_index()
     missing_t = [t for t in tickers if t not in wide.columns]
     if missing_t:
@@ -137,9 +152,11 @@ def _default_ckpt(model_dir):
 # Model weight extraction for all test dates
 # ---------------------------------------------------------------------------
 
-def _windows_for_date(meta_test, x_test, pair_key_to_idx, n_pairs, F_dim, d):
+def windows_and_mask_for_date(meta_test, x_test, pair_key_to_idx, n_pairs, F_dim, d):
+    """Aligned windows and per-pair mask (1 = valid sequence for that date)."""
     sub = meta_test[meta_test["target_date"] == d]
     windows = np.zeros((n_pairs, x_test.shape[1], F_dim), dtype=np.float32)
+    mask = np.zeros(n_pairs, dtype=np.float32)
     present = []
     for _, row in sub.iterrows():
         iloc = row.name
@@ -148,10 +165,11 @@ def _windows_for_date(meta_test, x_test, pair_key_to_idx, n_pairs, F_dim, d):
             continue
         p_idx = pair_key_to_idx[pkey]
         windows[p_idx] = x_test[iloc]
+        mask[p_idx] = 1.0
         present.append(pkey)
     if not present:
-        return None
-    return windows
+        return None, None
+    return windows, mask
 
 
 def get_all_test_weights(model, meta_test, x_test, pairs, pair_key_to_idx, n_pairs, F_dim, dates):
@@ -159,13 +177,72 @@ def get_all_test_weights(model, meta_test, x_test, pairs, pair_key_to_idx, n_pai
     weights_by_date = {}
     model.eval()
     for d in dates:
-        windows = _windows_for_date(meta_test, x_test, pair_key_to_idx, n_pairs, F_dim, d)
+        windows, mask = windows_and_mask_for_date(
+            meta_test, x_test, pair_key_to_idx, n_pairs, F_dim, d,
+        )
         if windows is None:
             continue
         with torch.no_grad():
-            out = model.forward_step(windows, explore=False)
+            out = model.forward_step(windows, explore=False, pair_mask=mask)
         w = out["weights"].detach().cpu().numpy().reshape(-1)
         weights_by_date[d] = w
+    return weights_by_date
+
+
+def get_mphdrl_test_weights_via_env(
+    model,
+    meta_test,
+    x_test,
+    y_test,
+    pairs,
+    tickers,
+    ticker_to_idx,
+    spread_wide=None,
+):
+    """
+    Roll MPHDRL through TradingEnvironment on test split and apply stop-outs
+    via env.step() dynamics. Returns {date: stop-loss-adjusted weight vector}.
+    """
+    env = TradingEnvironment(
+        pairs=pairs,
+        tickers=tickers,
+        ticker_to_idx=ticker_to_idx,
+        trading_raw_path=os.path.join("data", "trading", "raw.csv"),
+        sequence_meta=meta_test,
+        X_train=x_test,
+        y_train=y_test,
+        zeta=HPARAMS["zeta"],
+        gamma=HPARAMS["gamma"],
+        risk_lambda=HPARAMS["risk_lambda"],
+        var_window=HPARAMS["var_window"],
+        terminal_utility_weight=HPARAMS["terminal_utility_weight"],
+        spread_pivot=spread_wide,
+        split="test",
+        txn_cost_rate=TXN_COST_RATE,
+        short_cost_annual=SHORT_COST_ANNUAL,
+        stcg_rate=STCG_RATE,
+        fiscal_year_end=FISCAL_YEAR_END,
+    )
+
+    weights_by_date = {}
+    state = env.reset()
+    model.eval()
+    while state is not None and env.t < len(env.unique_dates):
+        d_t = env.unique_dates[env.t]
+        windows, mask, y_spread = state
+        with torch.no_grad():
+            out = model.forward_step(windows, explore=False, pair_mask=mask)
+
+        raw_w = out["weights"].detach().cpu().numpy().reshape(-1)
+        sl_actions = out["sl_actions"].detach().cpu().numpy().reshape(-1)
+        spread_values = np.where(mask, y_spread, np.nan).astype(np.float64)
+        w_adj = env._apply_stop_outs(raw_w, sl_actions=sl_actions, spread_values=spread_values)
+        weights_by_date[d_t] = w_adj.astype(np.float64)
+
+        state, _, done = env.step(raw_w, sl_actions=sl_actions, spread_values=spread_values)
+        if done:
+            break
+
     return weights_by_date
 
 # ---------------------------------------------------------------------------
@@ -306,6 +383,7 @@ def run_strategy_backtest(strategy_name, weights_by_date, price_wide, tickers, t
 
         net_pv += net_pnl
 
+        mean_abs_w = float(np.nanmean(np.abs(w)))
         rows.append({
             "date": d_t,
             "gross_portfolio_value": gross_pv,
@@ -324,6 +402,8 @@ def run_strategy_backtest(strategy_name, weights_by_date, price_wide, tickers, t
             "net_short_return": net_short_ret,
             "net_portfolio_value": net_pv,
             "net_portfolio_return": net_portfolio_ret,
+            "mean_abs_weight": mean_abs_w,
+            "l1_turnover": float(total_turnover),
         })
 
         prev_w = w.copy()
@@ -333,13 +413,27 @@ def run_strategy_backtest(strategy_name, weights_by_date, price_wide, tickers, t
     print(f"  {strategy_name}: {len(df)} trading days simulated")
     return df
 
+
+def print_zero_weight_diagnostics(label, weights_by_date):
+    n_days = len(weights_by_date)
+    if n_days == 0:
+        print(f"  {label} zero-weight days: n/a (no weights)")
+        return
+    n_zero = 0
+    for w in weights_by_date.values():
+        wv = np.asarray(w, dtype=np.float64)
+        if not np.isfinite(wv).all() or np.nansum(np.abs(wv)) < 1e-10:
+            n_zero += 1
+    pct = 100.0 * n_zero / max(n_days, 1)
+    print(f"  {label} zero-weight days: {n_zero}/{n_days} ({pct:.2f}%)")
+
 # ---------------------------------------------------------------------------
 # CLI + main
 # ---------------------------------------------------------------------------
 
 def parse_args():
     p = argparse.ArgumentParser(description="Walk-forward backtest for RL Pairs Trading")
-    p.add_argument("--device", type=str, default="cpu", help="torch device (default: cpu)")
+    p.add_argument("--device", type=str, default="cpu", help="torch device: cpu, cuda, mps, or auto (default: cpu)")
     p.add_argument(
         "--mphdrl-checkpoint", type=str, default=None, dest="mphdrl_ckpt",
         help="MPHDRL .pt checkpoint (default: models/MPHDRL/final.pt or checkpoint.pt)",
@@ -347,6 +441,10 @@ def parse_args():
     p.add_argument(
         "--benchmark-checkpoint", type=str, default=None, dest="bench_ckpt",
         help="Benchmark .pt checkpoint (default: models/benchmark/final.pt or checkpoint.pt)",
+    )
+    p.add_argument(
+        "--srrl-checkpoint", type=str, default=None, dest="srrl_ckpt",
+        help="SRRL .pt checkpoint (default: models/srrl/final.pt or checkpoint.pt)",
     )
     p.add_argument(
         "--traditional-params",
@@ -357,13 +455,34 @@ def parse_args():
             f"(default: use built-in fixed params, or merge {TRADITIONAL_PARAMS_PATH} if present)"
         ),
     )
+    p.add_argument(
+        "--traditional-pick",
+        type=str,
+        choices=("weakest", "baseline"),
+        default="weakest",
+        help=(
+            "weakest: score several rule presets on this walk-forward window and use "
+            "the lowest-utility one (easier RL benchmark). baseline: pickle/defaults only."
+        ),
+    )
     return p.parse_args()
+
+
+def resolve_backtest_device(preference: str) -> torch.device:
+    name = (preference or "cpu").strip().lower()
+    if name == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    return torch.device(name)
 
 
 def main():
     args = parse_args()
     os.makedirs(BACKTEST_DIR, exist_ok=True)
-    dev = torch.device(args.device)
+    dev = resolve_backtest_device(args.device)
 
     print("=" * 60)
     print("Walk-Forward Backtest")
@@ -371,7 +490,12 @@ def main():
 
     # --- Load test spread data ---
     x_test, y_test, pairs, meta_test = load_test_bundle()
-    M, tickers, ticker_to_idx = build_pair_ticker_mapping(pairs)
+    hedge_path_for_M = os.path.join("data", "pickle", "hedge_ratios.pkl")
+    _hr = None
+    if os.path.isfile(hedge_path_for_M):
+        with open(hedge_path_for_M, "rb") as f:
+            _hr = pickle.load(f)
+    M, tickers, ticker_to_idx = build_pair_ticker_mapping(pairs, hedge_ratios=_hr)
     n_pairs = len(pairs)
     n_tickers = len(tickers)
     F_dim = x_test.shape[2]
@@ -409,33 +533,79 @@ def main():
     bench_model.load_checkpoint(bench_ckpt)
     bench_model.eval()
 
+    srrl_ckpt = args.srrl_ckpt or _default_ckpt(SRRL_MODEL_DIR)
+    srrl_model = None
+    if srrl_ckpt is not None and os.path.isfile(srrl_ckpt):
+        srrl_model = SRRLTrader(F_dim, n_pairs, n_tickers, M, device=str(dev))
+        srrl_model.load_checkpoint(srrl_ckpt)
+        srrl_model.eval()
+    else:
+        print(f"  INFO: No SRRL checkpoint found under {SRRL_MODEL_DIR}. Skipping SRRL backtest.")
+
     print(f"\nMPHDRL checkpoint:    {os.path.abspath(mphdrl_ckpt)}")
     print(f"Benchmark checkpoint: {os.path.abspath(bench_ckpt)}")
+    if srrl_model is not None:
+        print(f"SRRL checkpoint:      {os.path.abspath(srrl_ckpt)}")
     print(f"Initial cash: {INITIAL_CASH:,.0f} INR")
     print(f"Txn cost: {TXN_COST_RATE*100:.5f}%  |  Short cost: {SHORT_COST_ANNUAL*100:.2f}% ann.")
     print(f"STCG: {STCG_RATE*100:.0f}%  |  LTCG: {LTCG_RATE*100:.1f}%")
     print()
 
+    spread_raw_path = os.path.join("data", "spread", "raw.csv")
+    spread_wide = load_precomputed_spread_wide(spread_raw_path) if os.path.isfile(spread_raw_path) else None
+
     # --- Extract weights for all test dates ---
     print("Extracting model weights for all test dates...")
-    mphdrl_weights = get_all_test_weights(
-        mphdrl_model, meta_test, x_test, pairs, pair_key_to_idx, n_pairs, F_dim, test_dates,
+    mphdrl_weights = get_mphdrl_test_weights_via_env(
+        mphdrl_model,
+        meta_test,
+        x_test,
+        y_test,
+        pairs,
+        tickers,
+        ticker_to_idx,
+        spread_wide=spread_wide,
     )
     bench_weights = get_all_test_weights(
         bench_model, meta_test, x_test, pairs, pair_key_to_idx, n_pairs, F_dim, test_dates,
     )
     print(f"  MPHDRL dates with weights: {len(mphdrl_weights)}")
     print(f"  Benchmark dates with weights: {len(bench_weights)}")
+    print_zero_weight_diagnostics("MPHDRL", mphdrl_weights)
+    print_zero_weight_diagnostics("Benchmark", bench_weights)
+
+    srrl_weights: dict = {}
+    if srrl_model is not None:
+        srrl_weights = get_all_test_weights(
+            srrl_model, meta_test, x_test, pairs, pair_key_to_idx, n_pairs, F_dim, test_dates,
+        )
+        print(f"  SRRL dates with weights: {len(srrl_weights)}")
+        print_zero_weight_diagnostics("SRRL", srrl_weights)
 
     trad_weights: dict = {}
     hedge_path = os.path.join("data", "pickle", "hedge_ratios.pkl")
-    spread_raw_path = os.path.join("data", "spread", "raw.csv")
     if os.path.isfile(hedge_path) and os.path.isfile(spread_raw_path):
         # Same pairs as RL; hedge_ratios.pkl + spread/raw.csv are pipeline outputs (not recomputed).
-        trad_params = resolve_traditional_params(args.traditional_params or TRADITIONAL_PARAMS_PATH)
         with open(hedge_path, "rb") as f:
             hedge_ratios = pickle.load(f)
-        spread_wide = load_precomputed_spread_wide(spread_raw_path)
+        pick = (os.environ.get("TRADITIONAL_PICK") or args.traditional_pick or "weakest").strip().lower()
+        if pick == "baseline":
+            trad_params = resolve_traditional_params(args.traditional_params or TRADITIONAL_PARAMS_PATH)
+            print("  Traditional: baseline params (pickle merge / defaults).")
+        else:
+            trad_params, trad_variant, util_by = pick_weakest_traditional_params(
+                valid_dates,
+                pairs,
+                hedge_ratios,
+                price_wide,
+                tickers,
+                spread_wide=spread_wide,
+                gamma=0.5,
+            )
+            print(f"  Traditional: weakest variant = {trad_variant!r} (min utility among presets).")
+            for vn, uu in sorted(util_by.items(), key=lambda kv: (kv[1] if np.isfinite(kv[1]) else float("inf"))):
+                u_str = f"{uu:.6f}" if np.isfinite(uu) else "nan"
+                print(f"    utility[{vn}] = {u_str}")
         trad_weights = compute_traditional_weights_by_date(
             valid_dates, pairs, hedge_ratios, trad_params, spread_wide=spread_wide,
         )
@@ -452,12 +622,23 @@ def main():
     df_trad = run_strategy_backtest(
         "Traditional pairs", trad_weights, price_wide, tickers, valid_dates,
     )
+    df_srrl = run_strategy_backtest("SRRL", srrl_weights, price_wide, tickers, valid_dates)
+
+    nifty_path = os.path.join("data", "trading", "nifty50.csv")
+    df_nifty = run_nifty50_buy_hold_backtest(
+        "Nifty 50 buy-and-hold",
+        valid_dates,
+        nifty_path=nifty_path,
+        initial_cash=INITIAL_CASH,
+    )
 
     # --- Export ---
     for name, df in [
         ("mphdrl", df_mphdrl),
         ("benchmark", df_bench),
         ("traditional", df_trad),
+        ("srrl", df_srrl),
+        ("nifty50_buy_hold", df_nifty),
     ]:
         out_path = os.path.join(BACKTEST_DIR, f"{name}.csv")
         df.to_csv(out_path, index=False)
@@ -471,6 +652,8 @@ def main():
         ("MPHDRL", df_mphdrl),
         ("Benchmark RL", df_bench),
         ("Traditional pairs", df_trad),
+        ("SRRL", df_srrl),
+        ("Nifty 50 buy-and-hold", df_nifty),
     ]:
         if df.empty:
             print(f"  {label}: no data")
@@ -488,6 +671,11 @@ def main():
         print(f"    Total txn:    {total_txn:>14,.2f}")
         print(f"    Total short:  {total_short:>14,.2f}")
         print(f"    Total tax:    {total_tax:>14,.2f}")
+        if "mean_abs_weight" in df.columns and "l1_turnover" in df.columns:
+            print(
+                f"    Mean |w|:    {df['mean_abs_weight'].mean():>14.6f}  "
+                f"  Mean L1 turnover: {df['l1_turnover'].mean():>10.6f}"
+            )
     print("=" * 60)
 
 
