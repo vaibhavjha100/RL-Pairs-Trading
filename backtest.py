@@ -1,8 +1,10 @@
 """
-backtest.py -- Walk-forward backtesting for MPHDRL, Benchmark RL, and Traditional pairs.
+backtest.py -- Walk-forward backtesting for MPHDRL, Benchmark RL, Traditional pairs, SRRL, and Nifty 50 buy-and-hold.
 
 Produces daily gross/net PnL, returns, costs, taxes for each strategy and exports
 CSV files to data/backtest/ for downstream comparison (see comparison.py).
+Includes a Nifty 50 buy-and-hold benchmark from ``data/trading/nifty50.csv`` (see
+``backtest_core.run_nifty50_buy_hold_backtest`` for amortized costs/taxes).
 
 Usage:
     python backtest.py
@@ -31,10 +33,12 @@ from MPHDRL import (
 )
 from benchmark import BENCHMARK_MODEL_DIR, H_BENCHMARK, BenchmarkDDPG
 from SRRL import SRRL_MODEL_DIR, SRRLTrader
+from backtest_core import run_nifty50_buy_hold_backtest
 from traditional import (
     TRADITIONAL_PARAMS_PATH,
     compute_traditional_weights_by_date,
     load_precomputed_spread_wide,
+    pick_weakest_traditional_params,
     resolve_traditional_params,
 )
 
@@ -451,6 +455,16 @@ def parse_args():
             f"(default: use built-in fixed params, or merge {TRADITIONAL_PARAMS_PATH} if present)"
         ),
     )
+    p.add_argument(
+        "--traditional-pick",
+        type=str,
+        choices=("weakest", "baseline"),
+        default="weakest",
+        help=(
+            "weakest: score several rule presets on this walk-forward window and use "
+            "the lowest-utility one (easier RL benchmark). baseline: pickle/defaults only."
+        ),
+    )
     return p.parse_args()
 
 
@@ -572,9 +586,26 @@ def main():
     hedge_path = os.path.join("data", "pickle", "hedge_ratios.pkl")
     if os.path.isfile(hedge_path) and os.path.isfile(spread_raw_path):
         # Same pairs as RL; hedge_ratios.pkl + spread/raw.csv are pipeline outputs (not recomputed).
-        trad_params = resolve_traditional_params(args.traditional_params or TRADITIONAL_PARAMS_PATH)
         with open(hedge_path, "rb") as f:
             hedge_ratios = pickle.load(f)
+        pick = (os.environ.get("TRADITIONAL_PICK") or args.traditional_pick or "weakest").strip().lower()
+        if pick == "baseline":
+            trad_params = resolve_traditional_params(args.traditional_params or TRADITIONAL_PARAMS_PATH)
+            print("  Traditional: baseline params (pickle merge / defaults).")
+        else:
+            trad_params, trad_variant, util_by = pick_weakest_traditional_params(
+                valid_dates,
+                pairs,
+                hedge_ratios,
+                price_wide,
+                tickers,
+                spread_wide=spread_wide,
+                gamma=0.5,
+            )
+            print(f"  Traditional: weakest variant = {trad_variant!r} (min utility among presets).")
+            for vn, uu in sorted(util_by.items(), key=lambda kv: (kv[1] if np.isfinite(kv[1]) else float("inf"))):
+                u_str = f"{uu:.6f}" if np.isfinite(uu) else "nan"
+                print(f"    utility[{vn}] = {u_str}")
         trad_weights = compute_traditional_weights_by_date(
             valid_dates, pairs, hedge_ratios, trad_params, spread_wide=spread_wide,
         )
@@ -593,12 +624,21 @@ def main():
     )
     df_srrl = run_strategy_backtest("SRRL", srrl_weights, price_wide, tickers, valid_dates)
 
+    nifty_path = os.path.join("data", "trading", "nifty50.csv")
+    df_nifty = run_nifty50_buy_hold_backtest(
+        "Nifty 50 buy-and-hold",
+        valid_dates,
+        nifty_path=nifty_path,
+        initial_cash=INITIAL_CASH,
+    )
+
     # --- Export ---
     for name, df in [
         ("mphdrl", df_mphdrl),
         ("benchmark", df_bench),
         ("traditional", df_trad),
         ("srrl", df_srrl),
+        ("nifty50_buy_hold", df_nifty),
     ]:
         out_path = os.path.join(BACKTEST_DIR, f"{name}.csv")
         df.to_csv(out_path, index=False)
@@ -613,6 +653,7 @@ def main():
         ("Benchmark RL", df_bench),
         ("Traditional pairs", df_trad),
         ("SRRL", df_srrl),
+        ("Nifty 50 buy-and-hold", df_nifty),
     ]:
         if df.empty:
             print(f"  {label}: no data")

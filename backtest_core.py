@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import pickle
 import sys
-from typing import Dict, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -311,6 +311,129 @@ def run_strategy_backtest(strategy_name, weights_by_date, price_wide, tickers, e
 
     df = pd.DataFrame(rows, columns=RESULT_COLUMNS)
     print(f"  {strategy_name}: {len(df)} trading days simulated")
+    return df
+
+
+def run_nifty50_buy_hold_backtest(
+    strategy_name: str,
+    eval_dates: List[Any],
+    nifty_path: str | None = None,
+    price_col: str = "Adj Close",
+    initial_cash: float = INITIAL_CASH,
+    stcg_rate: float = STCG_RATE,
+    txn_cost_rate: float = TXN_COST_RATE,
+) -> pd.DataFrame:
+    """
+    Nifty 50 index buy-and-hold on ``eval_dates`` (same calendar as other strategies).
+
+    Gross path: fully invested in the index from ``initial_cash`` at the first usable
+    close; daily gross return follows index levels from ``nifty50.csv``.
+
+    Costs: one buy-side transaction charge on ``initial_cash`` and a simplified STCG
+    tax on the **total** index capital gain to the final mark (no daily mark-to-market
+    tax). Both are **split evenly across every simulated day** in INR so
+    ``transaction_cost`` and ``tax_flow`` are constant per row (shorting cost is zero).
+
+    This is a smoothed accounting benchmark, not identical to realized Indian tax lots.
+    """
+    path = nifty_path or os.path.join("data", "trading", "nifty50.csv")
+    if not os.path.isfile(path):
+        print(f"  {strategy_name}: missing {path} (skip)")
+        return pd.DataFrame(columns=RESULT_COLUMNS)
+
+    raw = pd.read_csv(path, parse_dates=["Date"])
+    if price_col not in raw.columns:
+        if "Close" in raw.columns:
+            price_col = "Close"
+        else:
+            print(f"  {strategy_name}: no price column in {path} (skip)")
+            return pd.DataFrame(columns=RESULT_COLUMNS)
+
+    raw = raw.sort_values("Date").drop_duplicates(subset=["Date"], keep="last")
+    series = raw.set_index("Date")[price_col].astype(float).sort_index()
+
+    steps: list[tuple[pd.Timestamp, float, float, float]] = []
+    for idx in range(len(eval_dates) - 1):
+        d0 = pd.Timestamp(eval_dates[idx]).normalize()
+        d1 = pd.Timestamp(eval_dates[idx + 1]).normalize()
+        if d0 not in series.index or d1 not in series.index:
+            continue
+        p0 = float(series.loc[d0])
+        p1 = float(series.loc[d1])
+        if not (np.isfinite(p0) and np.isfinite(p1)) or abs(p0) < 1e-12:
+            continue
+        gret = p1 / p0 - 1.0
+        steps.append((d0, gret, p0, p1))
+
+    if not steps:
+        print(f"  {strategy_name}: no overlapping Nifty prices for eval window (skip)")
+        return pd.DataFrame(columns=RESULT_COLUMNS)
+
+    n = len(steps)
+    gross_end = float(initial_cash)
+    for _, gret, _, _ in steps:
+        gross_end *= 1.0 + gret
+    gain = gross_end - float(initial_cash)
+    tax_total = max(0.0, gain) * float(stcg_rate)
+    txn_total = float(initial_cash) * float(txn_cost_rate)
+    daily_txn = txn_total / n
+    daily_tax_payment = tax_total / n
+
+    gross_pv = float(initial_cash)
+    net_pv = float(initial_cash)
+    tax_carryforward = 0.0
+    rows: list[dict[str, Any]] = []
+
+    for d0, gret, _p0, _p1 in steps:
+        gross_long_ret = gret
+        gross_short_ret = 0.0
+        gross_portfolio_ret = gret
+        gross_long_pnl = gross_pv * gret
+        gross_short_pnl = 0.0
+        gross_pnl = gross_long_pnl
+        gross_pv += gross_pnl
+
+        txn_cost = daily_txn
+        shorting_cost = 0.0
+        tax_flow = -daily_tax_payment
+
+        net_long_pnl = gross_long_pnl - txn_cost + tax_flow
+        net_short_pnl = 0.0
+        net_pnl = net_long_pnl + net_short_pnl
+        net_long_ret = net_long_pnl / net_pv if net_pv else 0.0
+        net_short_ret = 0.0
+        net_portfolio_ret = net_pnl / net_pv if net_pv else 0.0
+        net_pv += net_pnl
+
+        rows.append(
+            {
+                "date": d0,
+                "gross_portfolio_value": gross_pv,
+                "gross_long_pnl": gross_long_pnl,
+                "gross_short_pnl": gross_short_pnl,
+                "gross_long_return": gross_long_ret,
+                "gross_short_return": gross_short_ret,
+                "gross_portfolio_return": gross_portfolio_ret,
+                "transaction_cost": txn_cost,
+                "shorting_cost": shorting_cost,
+                "tax_flow": tax_flow,
+                "tax_carryforward": tax_carryforward,
+                "net_long_pnl": net_long_pnl,
+                "net_short_pnl": net_short_pnl,
+                "net_long_return": net_long_ret,
+                "net_short_return": net_short_ret,
+                "net_portfolio_value": net_pv,
+                "net_portfolio_return": net_portfolio_ret,
+                "mean_abs_weight": 1.0,
+                "l1_turnover": 0.0,
+            }
+        )
+
+    df = pd.DataFrame(rows, columns=RESULT_COLUMNS)
+    print(
+        f"  {strategy_name}: {len(df)} trading days (buy-hold; "
+        f"txn amort {daily_txn:.2f}/day, tax amort {daily_tax_payment:.2f}/day on {n} days)"
+    )
     return df
 
 

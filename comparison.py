@@ -3,7 +3,7 @@ comparison.py -- Formal backtest comparison: performance metrics, common-size co
 and one-tailed paired Wilcoxon signed-rank tests on daily mean-variance utility (net).
 
 Reads CSVs from backtest.py:
-    data/backtest/mphdrl.csv, benchmark.csv, traditional.csv
+    data/backtest/mphdrl.csv, nifty50_buy_hold.csv, benchmark.csv, traditional.csv, srrl.csv
 
 Writes:
     data/backtest/results/comparison_summary.txt
@@ -52,6 +52,7 @@ DEFAULT_SIGNIFICANCE_ALPHA = 0.05
 
 STRATEGY_FILES = (
     ("MPHDRL", "mphdrl.csv"),
+    ("Nifty 50 buy-and-hold", "nifty50_buy_hold.csv"),
     ("Benchmark RL", "benchmark.csv"),
     ("Traditional pairs", "traditional.csv"),
     ("SRRL", "srrl.csv"),
@@ -500,6 +501,15 @@ def main() -> None:
 
     wilcox_rows: list[dict[str, Any]] = []
     if "MPHDRL" in util_series:
+        if "Nifty 50 buy-and-hold" in util_series:
+            wilcox_rows.append(
+                run_wilcoxon_paired(
+                    util_series["MPHDRL"],
+                    util_series["Nifty 50 buy-and-hold"],
+                    "MPHDRL",
+                    "Nifty 50 buy-and-hold",
+                )
+            )
         if "Benchmark RL" in util_series:
             wilcox_rows.append(
                 run_wilcoxon_paired(util_series["MPHDRL"], util_series["Benchmark RL"], "MPHDRL", "Benchmark RL")
