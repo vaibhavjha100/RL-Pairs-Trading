@@ -40,10 +40,13 @@ except ImportError as e:
     ) from e
 
 try:
-    from backtest import BACKTEST_DIR, INITIAL_CASH
+    from backtest_core import INITIAL_CASH
+except ImportError:
+    INITIAL_CASH = 10_000_000.0
+try:
+    from backtest import BACKTEST_DIR
 except ImportError:
     BACKTEST_DIR = os.path.join("data", "backtest")
-    INITIAL_CASH = 10_000_000.0
 
 try:
     from backtest_core import BACKTEST_RISK_AVERSION as UTILITY_GAMMA
