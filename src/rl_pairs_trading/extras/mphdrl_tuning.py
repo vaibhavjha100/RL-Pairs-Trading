@@ -1,13 +1,11 @@
 """
-MPHDRL hyperparameter tuning runner.
+Goal: Tune MPHDRL hyperparameters through staged trial execution and scoring.
 
-Stages:
-  - Stage 0 baseline
-  - Stage 1 coarse random search
-  - Stage 2 focused refinement around top configs
-  - Stage 3 seed confirmation for finalists
+Inputs: Search-space settings, training env overrides, and backtest evaluation artifacts.
 
-Training is invoked via environment variables (see training.py): MPHDRL_HP_PATCH, etc.
+Processing: Generates trial configs, executes training/backtest subprocesses, and ranks utilities.
+
+Outputs: Trial logs/results/selection artifacts under artifacts/mphdrl_tuning and related model outputs.
 """
 
 from __future__ import annotations

@@ -1,3 +1,13 @@
+"""
+Goal: Prepare trading and spread features for model training/testing workflows.
+
+Inputs: Raw trading/spread CSVs from data directories plus optional external feature libraries.
+
+Processing: Cleans data, engineers indicators/features, performs scaling/label generation, and splits datasets.
+
+Outputs: Preprocessed CSV/pickle feature bundles under data/spread and data/pickle.
+"""
+
 import os
 import sys
 import pickle

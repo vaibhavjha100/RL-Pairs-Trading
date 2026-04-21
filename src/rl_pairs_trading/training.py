@@ -1,21 +1,11 @@
 """
-training.py -- MPHDRL training harness for RL pairs trading.
+Goal: Train essential RL agents (MPHDRL and Benchmark) and promote best in-sample checkpoints.
 
-Run with no arguments:
-    python training.py
+Inputs: Training CLI/env settings, preprocessed data artifacts, and optional tuning parameter patches.
 
-Hyperparameters start from MPHDRL.py defaults each run, then optionally merge the best row from
-artifacts/mphdrl_tuning/trials.csv if tuning has been run; otherwise defaults are used unchanged.
-Single continuous RL schedule (no classification phase).
+Processing: Loads data, configures device/runtime, trains selected agent, and evaluates candidate checkpoints.
 
-Optional environment overrides (for automation / mphdrl_tuning.py):
-    MPHDRL_TRAIN_EPOCHS, MPHDRL_DEVICE, MPHDRL_SEED, MPHDRL_SAVE_EVERY, MPHDRL_TUNING_DIR,
-    MPHDRL_HP_PATCH (path to JSON hyperparameter patch), MPHDRL_NO_AMP, MPHDRL_NO_COMPILE,
-    MPHDRL_DIAG_NO_RISK_TAX.
-
-SRRL trainer code is retained below but commented out of the registry.
-
-On CUDA (default): cudnn benchmark, TF32, mixed precision, torch.compile unless disabled.
+Outputs: Agent checkpoints under models/* and in-sample selection reports under artifacts/insample_selection.
 """
 
 import argparse

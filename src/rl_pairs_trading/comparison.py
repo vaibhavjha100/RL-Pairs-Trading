@@ -1,21 +1,11 @@
 """
-comparison.py -- Formal backtest comparison: performance metrics, common-size costs,
-and one-tailed paired Wilcoxon signed-rank tests on daily mean-variance utility (net).
+Goal: Compare strategy backtest outputs with unified metrics and statistical significance tests.
 
-Reads CSVs from backtest.py:
-    data/backtest/mphdrl.csv, nifty50_buy_hold.csv, benchmark.csv, traditional.csv
+Inputs: Backtest CSV files from data/backtest plus configurable utility/test parameters.
 
-Writes:
-    data/backtest/results/comparison_summary.txt
-    data/backtest/results/comparison_metrics.csv
-    data/backtest/results/wilcoxon_utility.json
+Processing: Computes performance summaries, utility series, and paired Wilcoxon test results.
 
-Requires scipy (Wilcoxon test): pip install scipy
-
-Usage:
-    python comparison.py
-    python comparison.py --backtest-dir data/backtest --results-dir data/backtest/results
-    python comparison.py --alpha 0.05
+Outputs: Comparison reports/CSVs/JSON files under data/backtest/results.
 """
 
 from __future__ import annotations

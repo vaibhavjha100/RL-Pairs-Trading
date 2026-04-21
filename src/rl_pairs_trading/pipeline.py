@@ -1,11 +1,11 @@
 """
-Ordered pipeline: collection → preprocessing ×2 (after spread creates raw.csv) → optional EDA →
-train MPHDRL + Benchmark → backtest → comparison → market neutrality.
+Goal: Orchestrate the end-to-end essential pipeline steps in a fixed execution order.
 
-Run from repo root (with pip install -e .):
-  python -m rl_pairs_trading.pipeline
-  rl-pairs-pipeline
-Or: python run_pipeline.py
+Inputs: CLI flags, environment variables, and repo-root relative modules/data paths.
+
+Processing: Builds selected steps, runs subprocess modules, handles optional EDA execution, and logs progress.
+
+Outputs: Console/log step results and pipeline exit code; log files under artifacts/pipeline_logs.
 """
 
 from __future__ import annotations

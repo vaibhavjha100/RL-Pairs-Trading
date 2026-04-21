@@ -1,10 +1,11 @@
 """
-benchmark.py -- Plain-vanilla actor–critic (DDPG-style) baseline for pairs trading.
+Goal: Implement the benchmark RL baseline model used alongside MPHDRL.
 
-No SRL / gate: shared GRU per pair, Gaussian pair exposures E, fixed aggregation
-u = E @ M and same L1 + market-neutral projection as MPHDRL's portfolio tail for w.
+Inputs: Preprocessed feature tensors, pair mappings, and shared hyperparameter defaults.
 
-Checkpoints under models/benchmark/ (models/ is gitignored).
+Processing: Runs actor-critic forward logic, exploration behavior, and checkpoint serialization utilities.
+
+Outputs: Benchmark model checkpoints under models/benchmark and inference-ready model outputs.
 """
 
 from __future__ import annotations

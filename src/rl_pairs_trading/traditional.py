@@ -1,25 +1,11 @@
 """
-traditional.py -- Classical mean-reversion pairs trading; fixed rules for backtest traditional.csv.
+Goal: Compute traditional mean-reversion pair-trading weights and parameter handling.
 
-Data contract (read-only — nothing is re-estimated here):
+Inputs: Spread data, hedge ratios, optional parameter overrides, and evaluation dates.
 
-- **Pairs**: the caller passes the same ordered list as MPHDRL / benchmark RL
-  (typically `cointegrated_pairs.pkl` via `backtest.load_test_bundle`). This module
-  does not search for or change pairs.
+Processing: Builds z-score style signals, applies entry/exit logic, and maps pair weights to ticker exposure.
 
-- **Hedge ratios**: the caller passes the dict loaded from
-  `data/pickle/hedge_ratios.pkl` (written by `spread.py`). Betas are never
-  recomputed inside this module.
-
-- **Spreads**: use the precomputed close spread series from the pipeline, i.e.
-  `data/spread/raw.csv` (columns `Date`, `Pair`, `spread` — output of `spread.py`).
-  Spreads are never rebuilt from prices here.
-
-Hyperparameters (`lookback`, `z_entry`, `z_exit`) are fixed constants, optionally
-merged from a small pickle via `resolve_traditional_params`.
-
-Usage:
-    python traditional.py
+Outputs: Weight-by-date mappings and optional parameter artifacts consumed by backtest flows.
 """
 
 from __future__ import annotations

@@ -1,13 +1,11 @@
 """
-SRRL hyperparameter tuning runner.
+Goal: Tune SRRL hyperparameters within the extras experimentation workflow.
 
-Primary project workflow uses MPHDRL — see mphdrl_tuning.py for the default tuner.
+Inputs: SRRL search parameters, environment overrides, and generated backtest result files.
 
-Stages:
-  - Stage 0 baseline
-  - Stage 1 coarse random search
-  - Stage 2 focused refinement around top configs
-  - Stage 3 seed confirmation for finalists
+Processing: Runs staged trials, parses metrics, and compares candidates via utility-based ranking.
+
+Outputs: SRRL tuning logs/trial tables/checkpoint selections under artifacts/srrl_tuning.
 """
 
 from __future__ import annotations

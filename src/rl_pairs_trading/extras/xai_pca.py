@@ -1,3 +1,13 @@
+"""
+Goal: Interpret PCA-transformed spread features used by the broader modeling workflow.
+
+Inputs: Saved PCA objects, preprocessed spread features, and CLI analysis parameters.
+
+Processing: Maps principal components back to original features and ranks contribution strengths.
+
+Outputs: PCA interpretation summaries exported to configured result files/console output.
+"""
+
 from __future__ import annotations
 
 import argparse

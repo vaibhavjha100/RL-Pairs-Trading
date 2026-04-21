@@ -1,3 +1,13 @@
+"""
+Goal: Collect and persist raw market datasets required by later pipeline stages.
+
+Inputs: Ticker lists and remote market data sources configured in the script.
+
+Processing: Downloads/normalizes records, validates availability, and structures files for preprocessing.
+
+Outputs: Raw trading/reference artifacts written under data/trading and data/pickle.
+"""
+
 import os
 import sys
 import pickle

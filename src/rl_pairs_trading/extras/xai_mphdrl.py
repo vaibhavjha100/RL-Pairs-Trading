@@ -1,3 +1,13 @@
+"""
+Goal: Generate explainability analyses for MPHDRL model behavior on prepared datasets.
+
+Inputs: Trained MPHDRL checkpoints, feature bundles, and optional XAI configuration arguments.
+
+Processing: Computes attribution/importance diagnostics and aggregates interpretation statistics.
+
+Outputs: XAI reports/tables/plots under configured analysis output directories.
+"""
+
 from __future__ import annotations
 
 import argparse

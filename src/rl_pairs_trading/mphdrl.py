@@ -1,22 +1,11 @@
 """
-MPHDRL.py -- Multi-Pair Hybrid Deep Reinforcement Learning Trader
+Goal: Define MPHDRL model components, environment mechanics, and shared training primitives.
 
-Full model architecture extending HDRL-Trader (Kim et al., 2022) to a multi-pair
-portfolio setting. Contains all network modules, environment, replay buffer,
-target-network wiring, and checkpoint utilities.
+Inputs: Feature/label tensors, hyperparameters, pair mappings, and market data artifacts from data/*.
 
-Design reference: multi_pair_hdrl_trader_architecture.md (repo root). Implemented
-pieces match that document where noted below; deliberate or pending gaps:
+Processing: Implements neural modules, replay logic, environment transitions, and checkpoint utilities.
 
-- Stop-loss magnitudes are used in the portfolio network and stored in replay, but
-  TradingEnvironment does not yet simulate spread paths against stop boundaries (§6.2).
-- TD3 bootstrap uses next-state encodings and target-actor next discrete actions; it
-  does not re-evaluate target portfolio weights w' in the critic target (§8.2 optional
-  path); critics remain Q(S, A_pairs) as in §3.
-- Portfolio aggregation uses per-pair MLP scalars E_p then u = E @ M (same as u = M^T E
-  in column form); cross-pair attention from §5.4 is simplified to independent E_p heads.
-
-training.py orchestrates the training loop and should stay consistent with this module.
+Outputs: In-memory model/environment behavior and MPHDRL checkpoints under models/MPHDRL.
 """
 
 import os

@@ -1,16 +1,11 @@
 """
-backtest.py -- Walk-forward backtesting for MPHDRL, Benchmark RL, Traditional pairs, and Nifty 50 buy-and-hold.
+Goal: Run walk-forward backtests for essential strategies against shared market timelines.
 
-Produces daily gross/net PnL, returns, costs, taxes for each strategy and exports
-CSV files to data/backtest/ for downstream comparison (see comparison.py).
-Includes a Nifty 50 buy-and-hold benchmark from ``data/trading/nifty50.csv`` (see
-``backtest_core.run_nifty50_buy_hold_backtest`` for amortized costs/taxes).
+Inputs: Model checkpoints, preprocessed test bundles, price histories, and strategy parameter inputs.
 
-Usage:
-    python backtest.py
-    python backtest.py --device cpu
-    python backtest.py --mphdrl-checkpoint models/MPHDRL/final.pt \
-                       --benchmark-checkpoint models/benchmark/final.pt
+Processing: Generates daily weights, simulates portfolio PnL/cost/tax flows, and aggregates metrics.
+
+Outputs: Strategy backtest CSVs written to data/backtest for comparison and downstream analysis.
 """
 
 from __future__ import annotations

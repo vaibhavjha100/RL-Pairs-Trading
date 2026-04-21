@@ -1,3 +1,13 @@
+"""
+Goal: Build spread time series and hedge-ratio artifacts from selected pairs.
+
+Inputs: Cointegrated pairs, trading datasets, and required historical price windows.
+
+Processing: Calculates hedge ratios, computes pair spreads, and structures spread tables.
+
+Outputs: Spread raw dataset and hedge-ratio pickles under data/spread and data/pickle.
+"""
+
 import os
 import pickle
 import numpy as np

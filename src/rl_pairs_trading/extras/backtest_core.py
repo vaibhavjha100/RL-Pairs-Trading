@@ -1,3 +1,13 @@
+"""
+Goal: Provide reusable backtest helper utilities for extras tooling and analysis scripts.
+
+Inputs: Feature bundles, price data, strategy weights, and shared backtest parameter constants.
+
+Processing: Loads splits, computes weights-by-date helpers, and runs strategy backtest metric routines.
+
+Outputs: In-memory helper results and summary dictionaries consumed by extras scripts.
+"""
+
 from __future__ import annotations
 
 import os
