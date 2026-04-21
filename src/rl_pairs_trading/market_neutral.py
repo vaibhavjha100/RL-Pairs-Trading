@@ -1,21 +1,11 @@
 """
-market_neutral.py -- CAPM market-neutrality check for strategy backtests.
+Goal: Evaluate market neutrality of strategy returns using CAPM-style regressions.
 
-Runs CAPM regressions against Nifty 50 daily returns:
-    (r_p - r_f) = alpha + beta * (r_m - r_f) + eps
+Inputs: Strategy backtest returns, Nifty benchmark prices, and optional risk-free/backtest path args.
 
-Strategies checked:
-  - MPHDRL
-  - Benchmark RL
-  - Traditional pairs
+Processing: Builds excess-return series, fits CAPM regressions, and interprets beta neutrality signals.
 
-Data sources (defaults):
-  - data/backtest/{mphdrl,benchmark,traditional}.csv
-  - data/trading/nifty50.csv
-
-Usage:
-  python market_neutral.py
-  python market_neutral.py --risk-free-daily 0.0001
+Outputs: Console summary and optional persisted CAPM diagnostics for strategy neutrality checks.
 """
 
 from __future__ import annotations

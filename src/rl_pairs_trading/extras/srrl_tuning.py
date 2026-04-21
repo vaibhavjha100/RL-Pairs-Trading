@@ -1,13 +1,11 @@
 """
-SRRL hyperparameter tuning runner.
+Goal: Tune SRRL hyperparameters within the extras experimentation workflow.
 
-Primary project workflow uses MPHDRL — see mphdrl_tuning.py for the default tuner.
+Inputs: SRRL search parameters, environment overrides, and generated backtest result files.
 
-Stages:
-  - Stage 0 baseline
-  - Stage 1 coarse random search
-  - Stage 2 focused refinement around top configs
-  - Stage 3 seed confirmation for finalists
+Processing: Runs staged trials, parses metrics, and compares candidates via utility-based ranking.
+
+Outputs: SRRL tuning logs/trial tables/checkpoint selections under artifacts/srrl_tuning.
 """
 
 from __future__ import annotations
@@ -31,7 +29,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from backtest_core import summarize_backtest_dataframe
+from rl_pairs_trading.extras.backtest_core import summarize_backtest_dataframe
 
 EPOCH_RE = re.compile(
     r"Epoch\s+\d+/\d+\s+\|\s+[0-9.]+s\s+\|\s+(?:(?P<phase>[a-zA-Z_]+)\s+\|\s+)?trans=\d+\s+\|\s+(?P<losses>.*?)\s+\|\s+"
@@ -236,8 +234,9 @@ def run_trial(
     trial_env["SRRL_SAVE_EVERY"] = str(epochs)
     trial_env["SRRL_DEVICE"] = device
     trial_env["SRRL_SEED"] = str(seed)
+    trial_env["TRAINING_AGENT"] = "SRRL"
 
-    train_cmd = [pybin, "training.py"]
+    train_cmd = [pybin, "-m", "rl_pairs_trading.training"]
 
     train_proc = run_cmd(train_cmd, root, env=trial_env)
     log_path.write_text(train_proc.stdout + "\n\nSTDERR:\n" + train_proc.stderr, encoding="utf-8")

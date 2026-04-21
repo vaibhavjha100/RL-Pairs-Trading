@@ -1,13 +1,11 @@
 """
-MPHDRL hyperparameter tuning runner.
+Goal: Tune MPHDRL hyperparameters through staged trial execution and scoring.
 
-Stages:
-  - Stage 0 baseline
-  - Stage 1 coarse random search
-  - Stage 2 focused refinement around top configs
-  - Stage 3 seed confirmation for finalists
+Inputs: Search-space settings, training env overrides, and backtest evaluation artifacts.
 
-Training is invoked via environment variables (see training.py): MPHDRL_HP_PATCH, etc.
+Processing: Generates trial configs, executes training/backtest subprocesses, and ranks utilities.
+
+Outputs: Trial logs/results/selection artifacts under artifacts/mphdrl_tuning and related model outputs.
 """
 
 from __future__ import annotations
@@ -32,9 +30,9 @@ import pandas as pd
 import pickle
 import torch
 
-from MPHDRL import MPHDRLTrader, build_pair_ticker_mapping
+from rl_pairs_trading.mphdrl import MPHDRLTrader, build_pair_ticker_mapping
 
-from backtest_core import (
+from rl_pairs_trading.extras.backtest_core import (
     load_price_matrix,
     load_sequence_bundle,
     get_mphdrl_weights_by_env,
@@ -42,7 +40,7 @@ from backtest_core import (
     summarize_backtest_dataframe,
 )
 
-from training import merge_mphdrl_params_dict
+from rl_pairs_trading.training import merge_mphdrl_params_dict
 
 # MPHDRL logs: Epoch .../... | ...s | trans=... | loss keys (no SRRL sigma/churn line)
 EPOCH_RE = re.compile(
@@ -247,7 +245,7 @@ def score_mphdrl_checkpoint(root: Path, ckpt_path: Path, params: Dict[str, float
     spread_raw_path = root / "data" / "spread" / "raw.csv"
     spread_wide = None
     if spread_raw_path.is_file():
-        from traditional import load_precomputed_spread_wide
+        from rl_pairs_trading.traditional import load_precomputed_spread_wide
 
         spread_wide = load_precomputed_spread_wide(str(spread_raw_path))
 
@@ -295,8 +293,9 @@ def run_trial(
     trial_env["MPHDRL_SAVE_EVERY"] = str(epochs)
     trial_env["MPHDRL_DEVICE"] = device
     trial_env["MPHDRL_SEED"] = str(seed)
+    trial_env["TRAINING_AGENT"] = "MPHDRL"
 
-    train_cmd = [pybin, "training.py"]
+    train_cmd = [pybin, "-m", "rl_pairs_trading.training"]
 
     train_proc = run_cmd(train_cmd, root, env=trial_env)
     log_path.write_text(train_proc.stdout + "\n\nSTDERR:\n" + train_proc.stderr, encoding="utf-8")

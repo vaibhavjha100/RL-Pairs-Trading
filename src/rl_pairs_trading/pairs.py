@@ -1,3 +1,13 @@
+"""
+Goal: Discover tradable pairs using statistical cointegration screening.
+
+Inputs: Preprocessed trading data from data/trading and configured statistical thresholds.
+
+Processing: Runs pairwise tests, filters valid candidates, and assembles final cointegrated pair set.
+
+Outputs: Cointegrated pair artifacts saved under data/pickle for downstream spread construction.
+"""
+
 import os
 import sys
 import pickle

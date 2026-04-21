@@ -1,23 +1,14 @@
 """
-training.py -- MPHDRL training harness for RL pairs trading.
+Goal: Train essential RL agents (MPHDRL and Benchmark) and promote best in-sample checkpoints.
 
-Run with no arguments:
-    python training.py
+Inputs: Training CLI/env settings, preprocessed data artifacts, and optional tuning parameter patches.
 
-Hyperparameters start from MPHDRL.py defaults each run, then optionally merge the best row from
-artifacts/mphdrl_tuning/trials.csv if tuning has been run; otherwise defaults are used unchanged.
-Single continuous RL schedule (no classification phase).
+Processing: Loads data, configures device/runtime, trains selected agent, and evaluates candidate checkpoints.
 
-Optional environment overrides (for automation / mphdrl_tuning.py):
-    MPHDRL_TRAIN_EPOCHS, MPHDRL_DEVICE, MPHDRL_SEED, MPHDRL_SAVE_EVERY, MPHDRL_TUNING_DIR,
-    MPHDRL_HP_PATCH (path to JSON hyperparameter patch), MPHDRL_NO_AMP, MPHDRL_NO_COMPILE,
-    MPHDRL_DIAG_NO_RISK_TAX.
-
-SRRL trainer code is retained below but commented out of the registry.
-
-On CUDA (default): cudnn benchmark, TF32, mixed precision, torch.compile unless disabled.
+Outputs: Agent checkpoints under models/* and in-sample selection reports under artifacts/insample_selection.
 """
 
+import argparse
 import contextlib
 import copy
 import os
@@ -44,7 +35,7 @@ import torch.nn.functional as F
 #     check_data_readiness,
 # )
 # from benchmark import BENCHMARK_MODEL_DIR, BenchmarkDDPG
-from MPHDRL import (
+from rl_pairs_trading.mphdrl import (
     HPARAMS,
     MPHDRL_MODEL_DIR,
     MPHDRLTrader,
@@ -53,13 +44,12 @@ from MPHDRL import (
     build_pair_ticker_mapping,
     check_data_readiness,
 )
-from benchmark import BENCHMARK_MODEL_DIR, BenchmarkDDPG
+from rl_pairs_trading.benchmark import BENCHMARK_MODEL_DIR, BenchmarkDDPG
 
 # Frozen copy of MPHDRL.py defaults for reset before optional tuning merge.
 _DEFAULT_MPHDRL_HPARAMS = copy.deepcopy(dict(HPARAMS))
 # SRRL trainer disabled by default; keep imports so SRRL class bodies parse if restored.
-from SRRL import SRRL_HPARAMS, SRRL_MODEL_DIR, SRRLTrader
-from backtest_core import (
+from rl_pairs_trading.extras.backtest_core import (
     load_sequence_bundle,
     load_price_matrix,
     get_all_weights_by_date,
@@ -181,7 +171,21 @@ def merge_mphdrl_hp_patch_from_env() -> None:
 
 
 def load_training_config() -> SimpleNamespace:
-    """No CLI: defaults below; mphdrl_tuning sets MPHDRL_* environment variables."""
+    """Defaults from MPHDRL_* env; agent from ``--agent`` or TRAINING_AGENT / MPHDRL_AGENT."""
+    parser = argparse.ArgumentParser(description="Train RL pairs agents (MPHDRL, Benchmark).")
+    parser.add_argument(
+        "--agent",
+        default=None,
+        help="MPHDRL or Benchmark. Overrides TRAINING_AGENT / MPHDRL_AGENT.",
+    )
+    args_ns, _ = parser.parse_known_args()
+
+    raw_agent = args_ns.agent or os.environ.get("TRAINING_AGENT", os.environ.get("MPHDRL_AGENT", "MPHDRL"))
+    agent = str(raw_agent).strip()
+    if agent not in ("MPHDRL", "Benchmark"):
+        print(f"Unknown agent {agent!r}. Use MPHDRL or Benchmark.")
+        sys.exit(1)
+
     raw_epochs = os.environ.get("MPHDRL_TRAIN_EPOCHS", "").strip()
     epochs = int(raw_epochs) if raw_epochs else DEFAULT_TRAINING_EPOCHS
 
@@ -204,7 +208,7 @@ def load_training_config() -> SimpleNamespace:
     )
 
     return SimpleNamespace(
-        agent="MPHDRL",
+        agent=agent,
         epochs=epochs,
         save_every=max(1, save_every),
         device=device,
@@ -767,7 +771,7 @@ class UniformReplayBuffer:
 # Benchmark (DDPG-style) trainer
 # ============================================================================
 
-# @register_agent("Benchmark")
+@register_agent("Benchmark")
 class BenchmarkTrainer(BaseTrainer):
     """Plain actor–critic: Gaussian E, same env reward as MPHDRL, uniform replay."""
 
@@ -1570,21 +1574,16 @@ def _build_eval_model(agent_name: str, ckpt_path: str, f_dim: int, n_pairs: int,
         model.load_checkpoint(ckpt_path)
         model.eval()
         return model
-    # if agent_name == "Benchmark":
-    #     try:
-    #         raw_bench = torch.load(ckpt_path, map_location=str(device), weights_only=False)
-    #     except TypeError:
-    #         raw_bench = torch.load(ckpt_path, map_location=str(device))
-    #     hidden = int(raw_bench.get("meta", {}).get("hidden_size", 64))
-    #     model = BenchmarkDDPG(f_dim, n_pairs, n_tickers, M, hidden_size=hidden, device=str(device))
-    #     model.load_checkpoint(ckpt_path)
-    #     model.eval()
-    #     return model
-    # if agent_name == "SRRL":
-    #     model = SRRLTrader(f_dim, n_pairs, n_tickers, M, device=str(device))
-    #     model.load_checkpoint(ckpt_path)
-    #     model.eval()
-    #     return model
+    if agent_name == "Benchmark":
+        try:
+            raw_bench = torch.load(ckpt_path, map_location=str(device), weights_only=False)
+        except TypeError:
+            raw_bench = torch.load(ckpt_path, map_location=str(device))
+        hidden = int(raw_bench.get("meta", {}).get("hidden_size", 64))
+        model = BenchmarkDDPG(f_dim, n_pairs, n_tickers, M, hidden_size=hidden, device=str(device))
+        model.load_checkpoint(ckpt_path)
+        model.eval()
+        return model
     raise ValueError(f"Unsupported agent_name: {agent_name}")
 
 
@@ -1629,7 +1628,7 @@ def evaluate_and_promote_best_insample_checkpoint(
     spread_raw_path = os.path.join("data", "spread", "raw.csv")
     spread_wide = None
     if os.path.isfile(spread_raw_path):
-        from traditional import load_precomputed_spread_wide
+        from rl_pairs_trading.traditional import load_precomputed_spread_wide
 
         spread_wide = load_precomputed_spread_wide(spread_raw_path)
 
