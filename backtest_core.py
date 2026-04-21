@@ -11,6 +11,7 @@ import torch
 
 from MPHDRL import HPARAMS, TradingEnvironment
 
+# Notional starting capital (INR) for every walk-forward strategy CSV produced by backtest.py.
 INITIAL_CASH = 10_000_000
 TXN_COST_RATE = 0.0000307
 SHORT_COST_ANNUAL = 0.0657

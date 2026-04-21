@@ -33,7 +33,7 @@ from MPHDRL import (
 )
 from benchmark import BENCHMARK_MODEL_DIR, H_BENCHMARK, BenchmarkDDPG
 from SRRL import SRRL_MODEL_DIR, SRRLTrader
-from backtest_core import run_nifty50_buy_hold_backtest
+from backtest_core import INITIAL_CASH, run_nifty50_buy_hold_backtest
 from traditional import (
     TRADITIONAL_PARAMS_PATH,
     compute_traditional_weights_by_date,
@@ -42,9 +42,8 @@ from traditional import (
 )
 
 # ---------------------------------------------------------------------------
-# Parameters
+# Parameters (INITIAL_CASH is canonical in backtest_core.py — 10M INR for every strategy)
 # ---------------------------------------------------------------------------
-INITIAL_CASH = 10_000_000
 TXN_COST_RATE = 0.0000307
 SHORT_COST_ANNUAL = 0.0657
 SHORT_COST_DAILY = SHORT_COST_ANNUAL / 252
