@@ -34,7 +34,7 @@ import torch
 
 from rl_pairs_trading.mphdrl import MPHDRLTrader, build_pair_ticker_mapping
 
-from rl_pairs_trading.backtest_core import (
+from rl_pairs_trading.extras.backtest_core import (
     load_price_matrix,
     load_sequence_bundle,
     get_mphdrl_weights_by_env,

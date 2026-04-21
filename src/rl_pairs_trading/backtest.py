@@ -1,5 +1,5 @@
 """
-backtest.py -- Walk-forward backtesting for MPHDRL, Benchmark RL, Traditional pairs, SRRL, and Nifty 50 buy-and-hold.
+backtest.py -- Walk-forward backtesting for MPHDRL, Benchmark RL, Traditional pairs, and Nifty 50 buy-and-hold.
 
 Produces daily gross/net PnL, returns, costs, taxes for each strategy and exports
 CSV files to data/backtest/ for downstream comparison (see comparison.py).
@@ -32,8 +32,7 @@ from rl_pairs_trading.mphdrl import (
     build_pair_ticker_mapping,
 )
 from rl_pairs_trading.benchmark import BENCHMARK_MODEL_DIR, H_BENCHMARK, BenchmarkDDPG
-from rl_pairs_trading.srrl import SRRL_MODEL_DIR, SRRLTrader
-from rl_pairs_trading.backtest_core import INITIAL_CASH, run_nifty50_buy_hold_backtest
+from rl_pairs_trading.extras.backtest_core import INITIAL_CASH, run_nifty50_buy_hold_backtest
 from rl_pairs_trading.traditional import (
     TRADITIONAL_PARAMS_PATH,
     compute_traditional_weights_by_date,
@@ -441,10 +440,6 @@ def parse_args():
         help="Benchmark .pt checkpoint (default: models/benchmark/final.pt or checkpoint.pt)",
     )
     p.add_argument(
-        "--srrl-checkpoint", type=str, default=None, dest="srrl_ckpt",
-        help="SRRL .pt checkpoint (default: models/srrl/final.pt or checkpoint.pt)",
-    )
-    p.add_argument(
         "--traditional-params",
         type=str,
         default=None,
@@ -521,19 +516,10 @@ def main():
     bench_model.load_checkpoint(bench_ckpt)
     bench_model.eval()
 
-    srrl_ckpt = args.srrl_ckpt or _default_ckpt(SRRL_MODEL_DIR)
-    srrl_model = None
-    if srrl_ckpt is not None and os.path.isfile(srrl_ckpt):
-        srrl_model = SRRLTrader(F_dim, n_pairs, n_tickers, M, device=str(dev))
-        srrl_model.load_checkpoint(srrl_ckpt)
-        srrl_model.eval()
-    else:
-        print(f"  INFO: No SRRL checkpoint found under {SRRL_MODEL_DIR}. Skipping SRRL backtest.")
+    # SRRL is quarantined to extras and excluded from the essential pipeline.
 
     print(f"\nMPHDRL checkpoint:    {os.path.abspath(mphdrl_ckpt)}")
     print(f"Benchmark checkpoint: {os.path.abspath(bench_ckpt)}")
-    if srrl_model is not None:
-        print(f"SRRL checkpoint:      {os.path.abspath(srrl_ckpt)}")
     print(f"Initial cash: {INITIAL_CASH:,.0f} INR")
     print(f"Txn cost: {TXN_COST_RATE*100:.5f}%  |  Short cost: {SHORT_COST_ANNUAL*100:.2f}% ann.")
     print(f"STCG: {STCG_RATE*100:.0f}%  |  LTCG: {LTCG_RATE*100:.1f}%")
@@ -562,14 +548,6 @@ def main():
     print_zero_weight_diagnostics("MPHDRL", mphdrl_weights)
     print_zero_weight_diagnostics("Benchmark", bench_weights)
 
-    srrl_weights: dict = {}
-    if srrl_model is not None:
-        srrl_weights = get_all_test_weights(
-            srrl_model, meta_test, x_test, pairs, pair_key_to_idx, n_pairs, F_dim, test_dates,
-        )
-        print(f"  SRRL dates with weights: {len(srrl_weights)}")
-        print_zero_weight_diagnostics("SRRL", srrl_weights)
-
     trad_weights: dict = {}
     hedge_path = os.path.join("data", "pickle", "hedge_ratios.pkl")
     if os.path.isfile(hedge_path) and os.path.isfile(spread_raw_path):
@@ -594,7 +572,6 @@ def main():
     df_trad = run_strategy_backtest(
         "Traditional pairs", trad_weights, price_wide, tickers, valid_dates,
     )
-    df_srrl = run_strategy_backtest("SRRL", srrl_weights, price_wide, tickers, valid_dates)
 
     nifty_path = os.path.join("data", "trading", "nifty50.csv")
     df_nifty = run_nifty50_buy_hold_backtest(
@@ -609,7 +586,6 @@ def main():
         ("mphdrl", df_mphdrl),
         ("benchmark", df_bench),
         ("traditional", df_trad),
-        ("srrl", df_srrl),
         ("nifty50_buy_hold", df_nifty),
     ]:
         out_path = os.path.join(BACKTEST_DIR, f"{name}.csv")
@@ -624,7 +600,6 @@ def main():
         ("MPHDRL", df_mphdrl),
         ("Benchmark RL", df_bench),
         ("Traditional pairs", df_trad),
-        ("SRRL", df_srrl),
         ("Nifty 50 buy-and-hold", df_nifty),
     ]:
         if df.empty:

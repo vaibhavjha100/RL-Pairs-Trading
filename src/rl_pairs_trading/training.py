@@ -59,8 +59,7 @@ from rl_pairs_trading.benchmark import BENCHMARK_MODEL_DIR, BenchmarkDDPG
 # Frozen copy of MPHDRL.py defaults for reset before optional tuning merge.
 _DEFAULT_MPHDRL_HPARAMS = copy.deepcopy(dict(HPARAMS))
 # SRRL trainer disabled by default; keep imports so SRRL class bodies parse if restored.
-from rl_pairs_trading.srrl import SRRL_HPARAMS, SRRL_MODEL_DIR, SRRLTrader
-from rl_pairs_trading.backtest_core import (
+from rl_pairs_trading.extras.backtest_core import (
     load_sequence_bundle,
     load_price_matrix,
     get_all_weights_by_date,
@@ -187,14 +186,14 @@ def load_training_config() -> SimpleNamespace:
     parser.add_argument(
         "--agent",
         default=None,
-        help="MPHDRL, Benchmark, or SRRL. Overrides TRAINING_AGENT / MPHDRL_AGENT.",
+        help="MPHDRL or Benchmark. Overrides TRAINING_AGENT / MPHDRL_AGENT.",
     )
     args_ns, _ = parser.parse_known_args()
 
     raw_agent = args_ns.agent or os.environ.get("TRAINING_AGENT", os.environ.get("MPHDRL_AGENT", "MPHDRL"))
     agent = str(raw_agent).strip()
-    if agent not in ("MPHDRL", "Benchmark", "SRRL"):
-        print(f"Unknown agent {agent!r}. Use MPHDRL, Benchmark, or SRRL.")
+    if agent not in ("MPHDRL", "Benchmark"):
+        print(f"Unknown agent {agent!r}. Use MPHDRL or Benchmark.")
         sys.exit(1)
 
     raw_epochs = os.environ.get("MPHDRL_TRAIN_EPOCHS", "").strip()
@@ -1154,7 +1153,7 @@ class SRRLUniformReplay:
         return len(self.buffer)
 
 
-@register_agent("SRRL")
+# @register_agent("SRRL")
 class SRRLTrainer(BaseTrainer):
     """Supervised-RL Hybrid: classification gates DDPG actor for per-pair lever."""
 
@@ -1592,11 +1591,6 @@ def _build_eval_model(agent_name: str, ckpt_path: str, f_dim: int, n_pairs: int,
             raw_bench = torch.load(ckpt_path, map_location=str(device))
         hidden = int(raw_bench.get("meta", {}).get("hidden_size", 64))
         model = BenchmarkDDPG(f_dim, n_pairs, n_tickers, M, hidden_size=hidden, device=str(device))
-        model.load_checkpoint(ckpt_path)
-        model.eval()
-        return model
-    if agent_name == "SRRL":
-        model = SRRLTrader(f_dim, n_pairs, n_tickers, M, device=str(device))
         model.load_checkpoint(ckpt_path)
         model.eval()
         return model

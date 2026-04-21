@@ -3,7 +3,7 @@ comparison.py -- Formal backtest comparison: performance metrics, common-size co
 and one-tailed paired Wilcoxon signed-rank tests on daily mean-variance utility (net).
 
 Reads CSVs from backtest.py:
-    data/backtest/mphdrl.csv, nifty50_buy_hold.csv, benchmark.csv, traditional.csv, srrl.csv
+    data/backtest/mphdrl.csv, nifty50_buy_hold.csv, benchmark.csv, traditional.csv
 
 Writes:
     data/backtest/results/comparison_summary.txt
@@ -40,7 +40,7 @@ except ImportError as e:
     ) from e
 
 try:
-    from rl_pairs_trading.backtest_core import INITIAL_CASH
+    from rl_pairs_trading.extras.backtest_core import INITIAL_CASH
 except ImportError:
     INITIAL_CASH = 10_000_000.0
 try:
@@ -49,7 +49,7 @@ except ImportError:
     BACKTEST_DIR = os.path.join("data", "backtest")
 
 try:
-    from rl_pairs_trading.backtest_core import BACKTEST_RISK_AVERSION as UTILITY_GAMMA
+    from rl_pairs_trading.extras.backtest_core import BACKTEST_RISK_AVERSION as UTILITY_GAMMA
 except ImportError:
     UTILITY_GAMMA = 2.0
 
@@ -62,7 +62,6 @@ STRATEGY_FILES = (
     ("Nifty 50 buy-and-hold", "nifty50_buy_hold.csv"),
     ("Benchmark RL", "benchmark.csv"),
     ("Traditional pairs", "traditional.csv"),
-    ("SRRL", "srrl.csv"),
 )
 
 
@@ -525,15 +524,7 @@ def main() -> None:
             wilcox_rows.append(
                 run_wilcoxon_paired(util_series["MPHDRL"], util_series["Traditional pairs"], "MPHDRL", "Traditional pairs")
             )
-    if "SRRL" in util_series:
-        if "Traditional pairs" in util_series:
-            wilcox_rows.append(
-                run_wilcoxon_paired(util_series["SRRL"], util_series["Traditional pairs"], "SRRL", "Traditional pairs")
-            )
-        if "MPHDRL" in util_series:
-            wilcox_rows.append(
-                run_wilcoxon_paired(util_series["SRRL"], util_series["MPHDRL"], "SRRL", "MPHDRL")
-            )
+    # SRRL is quarantined to extras and excluded from essential comparison tests.
 
     tests_for_json: list[dict[str, Any]] = []
     for w in wilcox_rows:

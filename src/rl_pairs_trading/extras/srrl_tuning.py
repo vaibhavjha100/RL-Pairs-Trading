@@ -31,7 +31,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from rl_pairs_trading.backtest_core import summarize_backtest_dataframe
+from rl_pairs_trading.extras.backtest_core import summarize_backtest_dataframe
 
 EPOCH_RE = re.compile(
     r"Epoch\s+\d+/\d+\s+\|\s+[0-9.]+s\s+\|\s+(?:(?P<phase>[a-zA-Z_]+)\s+\|\s+)?trans=\d+\s+\|\s+(?P<losses>.*?)\s+\|\s+"

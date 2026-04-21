@@ -15,7 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from rl_pairs_trading.mphdrl import MPHDRL_MODEL_DIR, MPHDRLTrader, build_pair_ticker_mapping
-from rl_pairs_trading.backtest_core import load_sequence_bundle
+from rl_pairs_trading.extras.backtest_core import load_sequence_bundle
 
 try:
     from captum.attr import IntegratedGradients

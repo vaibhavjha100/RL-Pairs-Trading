@@ -59,7 +59,9 @@ def _run_step(
 
 
 def _eda_step(repo: Path, dry_run: bool, log_path: Path | None) -> int:
-    nb = repo / "eda.ipynb"
+    nb = repo / "src" / "rl_pairs_trading" / "eda.ipynb"
+    if not nb.is_file():
+        nb = repo / "eda.ipynb"
     line = f"\n{'=' * 60}\nSTEP: eda (notebook)\nTarget: {nb}\n"
     print(line, end="")
     _append_log(log_path, line)
