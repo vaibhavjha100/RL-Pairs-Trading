@@ -9,6 +9,7 @@ description = "RL pairs trading research code"
 requires-python = ">=3.10"
 dependencies = [
   "captum",
+  "jupyter",
   "matplotlib",
   "numpy",
   "pandas",

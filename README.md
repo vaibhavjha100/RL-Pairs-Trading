@@ -20,10 +20,10 @@ pip install --upgrade pip
 pip install -e .
 ```
 
-4. Download the Nifty 500 stock list from NSE and place it in `data/trading` (required for collection).
+4. Download the Nifty 500 stock list from NSE and place it in `data/trading` as `ind_nifty500list.csv` (required for collection).
 
 - Source: `https://www.nseindia.com/static/products-services/indices-nifty500-index`
-- Ensure the downloaded stock-list file is available under `data/trading` before running the pipeline.
+- Required path: `data/trading/ind_nifty500list.csv`
 
 ## Usage
 
@@ -66,6 +66,3 @@ rl-pairs-backtest
   - `torch`
   - `yfinance`
 
-## Licence
-
-This project is licensed under the MIT License.
