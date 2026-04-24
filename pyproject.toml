@@ -7,7 +7,21 @@ name = "rl-pairs-trading"
 version = "0.1.0"
 description = "RL pairs trading research code"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+  "captum",
+  "matplotlib",
+  "numpy",
+  "pandas",
+  "scikit-fuzzy",
+  "scikit-learn",
+  "scipy",
+  "seaborn",
+  "statsmodels",
+  "ta",
+  "TA-Lib",
+  "torch",
+  "yfinance",
+]
 
 [project.scripts]
 rl-pairs-train = "rl_pairs_trading.training:main"
